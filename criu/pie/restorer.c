@@ -178,7 +178,7 @@ struct vma_chunk_info {
 	} while (0)
 
 static struct task_entries *task_entries_local;
-static struct vma_worker_args global_worker_args[32]; /* Global for CLONE_VM children */
+static struct vma_worker_args global_worker_args[128]; /* Global for CLONE_VM children */
 static futex_t thread_inprogress;
 static pid_t *helpers;
 static int n_helpers;
@@ -2307,9 +2307,9 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	/* Parallel VMA loading if workers configured */
 	if (args->vma_parallel_workers > 0 && args->vma_ios_n >= 1) {
 		int num_workers = args->vma_parallel_workers;
-		pid_t worker_pids[32]; /* Max 32 workers */
+		pid_t worker_pids[128]; /* Max 128 workers */
 		struct vma_worker_args *worker_args = global_worker_args; /* Use global for CLONE_VM access */
-		void *worker_stacks[32];
+		void *worker_stacks[128];
 		futex_t worker_completion;
 		k_rtsigset_t sigchld_mask, old_mask;
 		int w, i, worker_base_idx;
@@ -2318,8 +2318,8 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 		pr_info("PIE: *** ENTERING PARALLEL VMA LOADING PATH ***\n");
 
-		if (num_workers > 32)
-			num_workers = 32;
+		if (num_workers > 128)
+			num_workers = 128;
 		if (num_workers > args->vma_ios_n)
 			num_workers = args->vma_ios_n;
 
