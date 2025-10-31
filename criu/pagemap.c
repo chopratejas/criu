@@ -347,6 +347,16 @@ int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, st
 	 */
 	iov = &cur_async->to[cur_async->nr - 1];
 	if (iov->iov_base + iov->iov_len == buf) {
+		/* Check if extending would exceed max iovec size */
+		if (opts.max_iovec_mb > 0) {
+			unsigned long max_iovec_bytes = (unsigned long)opts.max_iovec_mb * 1024UL * 1024UL;
+			if (iov->iov_len + len > max_iovec_bytes) {
+				/* Hit max size limit, create new iovec */
+				pr_debug("Iovec hit max size (%lu MB), splitting\n",
+					 iov->iov_len / (1024UL * 1024UL));
+				return enqueue_async_iov(pr, buf, len, to);
+			}
+		}
 		/* Extendable */
 		iov->iov_len += len;
 	} else {

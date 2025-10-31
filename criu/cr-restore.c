@@ -456,8 +456,42 @@ static int collect_child_pids(int state, unsigned int *n)
 
 static int collect_helper_pids(struct task_restore_args *ta)
 {
+	pid_t *worker_slot;
+	int i;
+
+	pr_info("=== VMA PARALLEL: collect_helper_pids() ENTRY ===\n");
+	pr_info("VMA PARALLEL: opts.vma_parallel_workers = %d\n", opts.vma_parallel_workers);
+
 	ta->helpers = (pid_t *)rst_mem_align_cpos(RM_PRIVATE);
-	return collect_child_pids(TASK_HELPER, &ta->helpers_n);
+	pr_info("VMA PARALLEL: ta->helpers allocated at %p\n", ta->helpers);
+
+	/* Collect existing helper PIDs from process tree */
+	pr_info("VMA PARALLEL: Collecting existing helper PIDs...\n");
+	if (collect_child_pids(TASK_HELPER, &ta->helpers_n) < 0) {
+		pr_err("VMA PARALLEL: Failed to collect existing helper PIDs\n");
+		return -1;
+	}
+	pr_info("VMA PARALLEL: Found %d existing helper PIDs\n", ta->helpers_n);
+
+	/* Pre-allocate space for VMA workers that will be spawned at runtime */
+	ta->max_helpers = ta->helpers_n + opts.vma_parallel_workers;
+	pr_info("VMA PARALLEL: Pre-allocating %d total helper slots (%d existing + %d VMA workers)\n",
+		 ta->max_helpers, ta->helpers_n, opts.vma_parallel_workers);
+
+	for (i = 0; i < opts.vma_parallel_workers; i++) {
+		worker_slot = rst_mem_alloc(sizeof(pid_t), RM_PRIVATE);
+		if (!worker_slot) {
+			pr_err("VMA PARALLEL: Failed to pre-allocate helper slot for VMA worker %d\n", i);
+			return -1;
+		}
+		*worker_slot = 0;  /* Will be filled in by restorer at runtime */
+		pr_info("VMA PARALLEL: Pre-allocated worker slot %d at %p\n", i, worker_slot);
+	}
+
+	pr_info("VMA PARALLEL: collect_helper_pids() SUCCESS - %d helper slots ready\n", ta->max_helpers);
+	pr_info("=== VMA PARALLEL: collect_helper_pids() EXIT ===\n");
+
+	return 0;
 }
 
 static int collect_zombie_pids(struct task_restore_args *ta)
@@ -2216,6 +2250,7 @@ skip_ns_bouncing:
 	if (restore_switch_stage(CR_STATE_RESTORE_CREDS))
 		goto out_kill_network_unlocked;
 
+	print_mem_timing_stats();
 	timing_stop(TIME_RESTORE);
 
 	if (catch_tasks(root_seized)) {
@@ -2388,6 +2423,22 @@ int cr_restore_tasks(void)
 	if (opts.cpu_cap & CPU_CAP_IMAGE) {
 		if (cpu_validate_cpuinfo())
 			return -1;
+	}
+
+	/* HARDCODED FOR TESTING: Force VMA parallel workers = 4 */
+	{
+		pr_info("=== VMA PARALLEL WORKERS: HARDCODED TEST MODE ===\n");
+		opts.vma_parallel_workers = 4;
+		pr_info("VMA PARALLEL: *** HARDCODED TO 4 WORKERS FOR TESTING ***\n");
+		pr_info("VMA PARALLEL: Final opts.vma_parallel_workers = %d\n", opts.vma_parallel_workers);
+	}
+
+	/* HARDCODED FOR TESTING: Force max iovec size = 256MB */
+	{
+		pr_info("=== MAX IOVEC SIZE: HARDCODED TEST MODE ===\n");
+		opts.max_iovec_mb = 256;
+		pr_info("MAX IOVEC: *** HARDCODED TO 256 MB FOR TESTING ***\n");
+		pr_info("MAX IOVEC: Final opts.max_iovec_mb = %d MB\n", opts.max_iovec_mb);
 	}
 
 	if (prepare_task_entries() < 0)
@@ -3489,6 +3540,7 @@ static int sigreturn_restore(pid_t pid, struct task_restore_args *task_args, uns
 	task_args->thread_args = thread_args;
 
 	task_args->auto_dedup = opts.auto_dedup;
+	task_args->vma_parallel_workers = opts.vma_parallel_workers;
 
 	/*
 	 * In the restorer we need to know if it is SELinux or not. For SELinux

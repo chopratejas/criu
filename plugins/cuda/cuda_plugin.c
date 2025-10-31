@@ -6,6 +6,7 @@
 #include "proc_parse.h"
 #include "seize.h"
 #include "fault-injection.h"
+#include "pstree.h"
 
 #include <common/list.h>
 #include <compel/infect.h>
@@ -16,6 +17,9 @@
 #include <unistd.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <time.h>
+#include <pthread.h>
+#include <limits.h>
 
 /* cuda-checkpoint binary should live in your PATH */
 #define CUDA_CHECKPOINT "cuda-checkpoint"
@@ -47,10 +51,40 @@ bool plugin_disabled = false;
 
 bool plugin_added_to_inventory = false;
 
+/* Enable/disable async GPU restore overlap (for benchmarking) */
+static bool async_restore_enabled = true; /* Set to true for overlap measurements */
+
+/* Timing/profiling infrastructure */
+struct timing_stats {
+	unsigned long pause_devices_us;
+	unsigned long checkpoint_devices_us;
+	unsigned long resume_devices_us;
+	unsigned long total_cuda_checkpoint_calls;
+	unsigned long total_cuda_checkpoint_us;
+};
+
+static struct timing_stats g_timing_stats = { 0 };
+
+static inline unsigned long timespec_diff_us(struct timespec *start, struct timespec *end)
+{
+	unsigned long diff_sec = end->tv_sec - start->tv_sec;
+	long diff_nsec = end->tv_nsec - start->tv_nsec;
+	return (diff_sec * 1000000UL) + (diff_nsec / 1000);
+}
+
+#define TIMING_START(var) struct timespec var; clock_gettime(CLOCK_MONOTONIC, &var)
+#define TIMING_END(var, accum)                                                                                         \
+	do {                                                                                                           \
+		struct timespec __end;                                                                                 \
+		clock_gettime(CLOCK_MONOTONIC, &__end);                                                               \
+		accum += timespec_diff_us(&var, &__end);                                                              \
+	} while (0)
+
 struct pid_info {
 	int pid;
 	char checkpointed;
 	cuda_task_state_t initial_task_state;
+	int restore_tid; /* Cached restore TID to avoid redundant lookups */
 	struct list_head list;
 };
 
@@ -58,6 +92,20 @@ struct pid_info {
  * release them after we're done with the DUMP
  */
 static LIST_HEAD(cuda_pids);
+
+/* Async restore support */
+struct async_restore_task {
+	pthread_t thread;
+	int pid;
+	int result;
+	bool started;
+	bool completed;
+	struct list_head list;
+};
+
+static LIST_HEAD(async_restore_tasks);
+static pthread_mutex_t async_restore_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool async_restore_triggered = false; /* Track if we've started async restore */
 
 static void dealloc_pid_buffer(struct list_head *pid_buf)
 {
@@ -70,7 +118,20 @@ static void dealloc_pid_buffer(struct list_head *pid_buf)
 	}
 }
 
-static int add_pid_to_buf(struct list_head *pid_buf, int pid, cuda_task_state_t state)
+static void dealloc_async_restore_tasks(void)
+{
+	struct async_restore_task *task;
+	struct async_restore_task *n;
+
+	pthread_mutex_lock(&async_restore_lock);
+	list_for_each_entry_safe(task, n, &async_restore_tasks, list) {
+		list_del(&task->list);
+		xfree(task);
+	}
+	pthread_mutex_unlock(&async_restore_lock);
+}
+
+static int add_pid_to_buf(struct list_head *pid_buf, int pid, cuda_task_state_t state, int restore_tid)
 {
 	struct pid_info *new = xmalloc(sizeof(*new));
 
@@ -81,7 +142,10 @@ static int add_pid_to_buf(struct list_head *pid_buf, int pid, cuda_task_state_t 
 	new->pid = pid;
 	new->checkpointed = 0;
 	new->initial_task_state = state;
+	new->restore_tid = restore_tid; /* Cache the restore TID */
 	list_add_tail(&new->list, pid_buf);
+
+	pr_debug("Cached restore_tid %d for pid %d (state: %d)\n", restore_tid, pid, state);
 
 	return 0;
 }
@@ -91,6 +155,7 @@ static int launch_cuda_checkpoint(const char **args, char *buf, int buf_size)
 #define READ  0
 #define WRITE 1
 	int fd[2], buf_off;
+	TIMING_START(launch_start);
 
 	if (pipe(fd) != 0) {
 		pr_perror("Couldn't create pipes for reading cuda-checkpoint output");
@@ -177,6 +242,9 @@ static int launch_cuda_checkpoint(const char **args, char *buf, int buf_size)
 		pr_debug("cuda-checkpoint output ===>\n%s\n"
 			 "<=== cuda-checkpoint output\n",
 			 buf);
+
+	g_timing_stats.total_cuda_checkpoint_calls++;
+	TIMING_END(launch_start, g_timing_stats.total_cuda_checkpoint_us);
 
 	return exit_code;
 err:
@@ -339,47 +407,57 @@ static int resume_restore_thread(int restore_tid, k_rtsigset_t *save_sigset)
 
 int cuda_plugin_checkpoint_devices(int pid)
 {
-	int restore_tid;
+	int restore_tid = -1;
 	char msg_buf[CUDA_CKPT_BUF_SIZE];
 	int int_ret;
 	int status;
 	k_rtsigset_t save_sigset;
 	struct pid_info *task_info;
 	bool pid_found = false;
+	TIMING_START(checkpoint_start);
 
 	if (plugin_disabled) {
 		return -ENOTSUP;
 	}
 
-	restore_tid = get_cuda_restore_tid(pid);
-
-	/* We can possibly hit a race with cuInit() where we are past the point of
-	 * locking the process but at lock time cuInit() hadn't completed in which
-	 * case cuda-checkpoint will report that we're in an invalid state to
-	 * checkpoint
-	 */
-	if (restore_tid == -1) {
-		pr_info("No need to checkpoint devices on pid %d\n", pid);
-		return 0;
-	}
-
-	/* Check if the process is already in a checkpointed state */
+	/* Check if the process is already in a checkpointed state and get cached restore_tid */
 	list_for_each_entry(task_info, &cuda_pids, list) {
 		if (task_info->pid == pid) {
 			if (task_info->initial_task_state == CUDA_TASK_CHECKPOINTED) {
 				pr_info("pid %d already in a checkpointed state\n", pid);
 				return 0;
 			}
+			restore_tid = task_info->restore_tid; /* Use cached restore TID */
 			pid_found = true;
+			pr_debug("Using cached restore_tid %d for pid %d\n", restore_tid, pid);
 			break;
 		}
 	}
 
 	if (pid_found == false) {
+		/* Not found in cache, try to get it directly */
+		restore_tid = get_cuda_restore_tid(pid);
+
+		/* We can possibly hit a race with cuInit() where we are past the point of
+		 * locking the process but at lock time cuInit() hadn't completed in which
+		 * case cuda-checkpoint will report that we're in an invalid state to
+		 * checkpoint
+		 */
+		if (restore_tid == -1) {
+			pr_info("No need to checkpoint devices on pid %d\n", pid);
+			return 0;
+		}
+
 		/* We return an error here. The task should be restored
 		 * to its original state at cuda_plugin_fini().
 		 */
-		pr_err("Failed to track pid %d\n", pid);
+		pr_err("Failed to track pid %d (not found in pause cache)\n", pid);
+		return -1;
+	}
+
+	/* At this point we have a valid restore_tid from cache */
+	if (restore_tid == -1) {
+		pr_err("Invalid cached restore_tid for pid %d\n", pid);
 		return -1;
 	}
 
@@ -398,6 +476,11 @@ int cuda_plugin_checkpoint_devices(int pid)
 	}
 
 	int_ret = interrupt_restore_thread(restore_tid, &save_sigset);
+
+	TIMING_END(checkpoint_start, g_timing_stats.checkpoint_devices_us);
+	pr_info("CHECKPOINT_DEVICES on pid %d completed (cumulative time: %lu us)\n", pid,
+		g_timing_stats.checkpoint_devices_us);
+
 	return status != 0 ? -1 : int_ret;
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__CHECKPOINT_DEVICES, cuda_plugin_checkpoint_devices);
@@ -407,6 +490,7 @@ int cuda_plugin_pause_devices(int pid)
 	int restore_tid;
 	char msg_buf[CUDA_CKPT_BUF_SIZE];
 	cuda_task_state_t task_state;
+	TIMING_START(pause_start);
 
 	if (plugin_disabled) {
 		return -ENOTSUP;
@@ -436,14 +520,14 @@ int cuda_plugin_pause_devices(int pid)
 	if (task_state == CUDA_TASK_LOCKED) {
 		pr_info("pid %d already in a locked state\n", pid);
 		/* Leave this PID in a "locked" state at resume_device() */
-		add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_LOCKED);
+		add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_LOCKED, restore_tid);
 		return 0;
 	}
 
 	if (task_state == CUDA_TASK_CHECKPOINTED) {
 		/* We need to skip this PID in cuda_plugin_checkpoint_devices(),
 		 * and leave it in a "checkpoined" state at resume_device(). */
-		add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_CHECKPOINTED);
+		add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_CHECKPOINTED, restore_tid);
 		return 0;
 	}
 
@@ -456,11 +540,13 @@ int cuda_plugin_pause_devices(int pid)
 		return -1;
 	}
 
-	if (add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_RUNNING)) {
+	if (add_pid_to_buf(&cuda_pids, pid, CUDA_TASK_RUNNING, restore_tid)) {
 		pr_err("unable to track paused pid %d\n", pid);
 		goto unlock;
 	}
 
+	TIMING_END(pause_start, g_timing_stats.pause_devices_us);
+	pr_info("PAUSE_DEVICES on pid %d completed (cumulative time: %lu us)\n", pid, g_timing_stats.pause_devices_us);
 	return 0;
 unlock:
 	status = cuda_process_checkpoint_action(pid, ACTION_UNLOCK, 0, msg_buf, sizeof(msg_buf));
@@ -478,6 +564,7 @@ int resume_device(int pid, int checkpointed, cuda_task_state_t initial_task_stat
 	int ret = 0;
 	int int_ret;
 	k_rtsigset_t save_sigset;
+	TIMING_START(resume_start);
 
 	if (initial_task_state == CUDA_TASK_UNKNOWN) {
 		pr_info("skip resume for PID %d (unknown state)\n", pid);
@@ -525,20 +612,291 @@ int resume_device(int pid, int checkpointed, cuda_task_state_t initial_task_stat
 interrupt:
 	int_ret = interrupt_restore_thread(restore_tid, &save_sigset);
 
+	TIMING_END(resume_start, g_timing_stats.resume_devices_us);
+	pr_info("RESUME_DEVICE on pid %d completed (cumulative time: %lu us)\n", pid, g_timing_stats.resume_devices_us);
+
 	return ret != 0 ? ret : int_ret;
 }
 
+/* Option A: Check if a PID likely has CUDA based on checkpoint image data
+ * This checks for CUDA indicators without needing the process to be initialized
+ */
+static bool pid_has_cuda_in_checkpoint(int pid)
+{
+	char path[PATH_MAX];
+	FILE *fp;
+	char line[512];
+	bool has_cuda = false;
+
+	/* Check for CUDA UVM socket in files.img
+	 * CUDA tasks have unix sockets like @cuda-uvmfd-<namespace>-<pid>@
+	 */
+	snprintf(path, sizeof(path), "/proc/%d/net/unix", pid);
+	fp = fopen(path, "r");
+	if (fp) {
+		while (fgets(line, sizeof(line), fp)) {
+			if (strstr(line, "cuda-uvmfd")) {
+				pr_err("OPTION_A: pid %d has cuda-uvmfd socket in /proc\n", pid);
+				has_cuda = true;
+				break;
+			}
+		}
+		fclose(fp);
+	}
+
+	/* Also check for /dev/nvidia device mappings */
+	if (!has_cuda) {
+		snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+		fp = fopen(path, "r");
+		if (fp) {
+			while (fgets(line, sizeof(line), fp)) {
+				if (strstr(line, "/dev/nvidia") || strstr(line, "libcuda")) {
+					pr_err("OPTION_A: pid %d has nvidia device/lib mapping\n", pid);
+					has_cuda = true;
+					break;
+				}
+			}
+			fclose(fp);
+		}
+	}
+
+	return has_cuda;
+}
+
+/* Thread function for async GPU restore */
+static void *async_restore_thread(void *arg)
+{
+	struct async_restore_task *task = (struct async_restore_task *)arg;
+
+	pr_err("ASYNC_THREAD: starting restore for pid %d\n", task->pid);
+
+	task->result = resume_device(task->pid, 1, CUDA_TASK_RUNNING);
+
+	pthread_mutex_lock(&async_restore_lock);
+	task->completed = true;
+	pthread_mutex_unlock(&async_restore_lock);
+
+	pr_err("ASYNC_THREAD: completed restore for pid %d (result: %d)\n", task->pid, task->result);
+
+	return NULL;
+}
+
+/* POST_FORKING hook: Discover and start async GPU restore operations */
+int cuda_plugin_post_forking(void)
+{
+	struct pstree_item *item;
+	int ret = 0;
+	int cuda_task_count = 0;
+
+	pr_err("===== POST_FORKING HOOK CALLED =====\n");
+
+	if (plugin_disabled) {
+		pr_err("POST_FORKING: plugin_disabled=true, returning -ENOTSUP\n");
+		return -ENOTSUP;
+	}
+
+	if (!async_restore_enabled) {
+		pr_err("POST_FORKING: async_restore_enabled=false, skipping overlap (baseline mode)\n");
+		return 0;
+	}
+
+	pr_err("POST_FORKING: Scanning for CUDA tasks to restore asynchronously\n");
+
+	/* Iterate through all tasks and start async restore for those with CUDA */
+	for_each_pstree_item(item) {
+		struct async_restore_task *task;
+		bool has_cuda_checkpoint;
+
+		pr_err("POST_FORKING: Checking pstree_item real_pid=%d state=%d\n",
+		       item->pid ? item->pid->real : -1,
+		       item->pid ? item->pid->state : -1);
+
+		if (!task_alive(item)) {
+			pr_err("POST_FORKING: pid=%d not alive, skipping\n", item->pid ? item->pid->real : -1);
+			continue;
+		}
+
+		/* OPTION A: Check if PID has CUDA indicators in /proc (checkpoint state) */
+		has_cuda_checkpoint = pid_has_cuda_in_checkpoint(item->pid->real);
+		pr_err("POST_FORKING: pid=%d checkpoint CUDA check = %d\n", item->pid->real, has_cuda_checkpoint);
+
+		if (!has_cuda_checkpoint) {
+			/* No CUDA indicators in checkpoint, skip */
+			continue;
+		}
+
+		pr_err("POST_FORKING: pid=%d HAS CUDA, will start async restore\n", item->pid->real);
+
+		/* Register and start async restore for this task */
+		task = xmalloc(sizeof(*task));
+		if (task == NULL) {
+			pr_err("Failed to allocate async restore task for pid %d\n", item->pid->real);
+			ret = -1;
+			continue;
+		}
+
+		task->pid = item->pid->real;
+		task->result = 0;
+		task->started = false;
+		task->completed = false;
+
+		pthread_mutex_lock(&async_restore_lock);
+		list_add_tail(&task->list, &async_restore_tasks);
+		pthread_mutex_unlock(&async_restore_lock);
+
+		pr_err("POST_FORKING: launching async restore thread for CUDA task pid %d\n", task->pid);
+
+		if (pthread_create(&task->thread, NULL, async_restore_thread, task) != 0) {
+			pr_perror("Failed to create async restore thread for pid %d", task->pid);
+			ret = -1;
+		} else {
+			task->started = true;
+			cuda_task_count++;
+		}
+	}
+
+	pthread_mutex_lock(&async_restore_lock);
+	if (cuda_task_count > 0) {
+		async_restore_triggered = true;
+	}
+	pthread_mutex_unlock(&async_restore_lock);
+
+	pr_err("POST_FORKING: Started async restore for %d CUDA tasks (triggered=%d)\n",
+	       cuda_task_count, async_restore_triggered);
+
+	return ret;
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__POST_FORKING, cuda_plugin_post_forking);
+
 int cuda_plugin_resume_devices_late(int pid)
 {
+	struct async_restore_task *task;
+	int ret = 0;
+
 	if (plugin_disabled) {
 		return -ENOTSUP;
 	}
 
-	/* RESUME_DEVICES_LATE is used during `criu restore`.
-	 * Here, we assume that users expect the target process
-	 * to be in a "running" state after restore, even if it was
-	 * in a "locked" or "checkpointed" state during `criu dump`.
+	/* OPTION B: If async restore wasn't triggered by POST_FORKING, OR if this task
+	 * wasn't found by Option A, trigger async restore for remaining tasks.
+	 * This catches tasks that were forked after POST_FORKING.
 	 */
+	if (!async_restore_enabled) {
+		/* Baseline mode: no async restore, do everything synchronously */
+		pr_info("RESUME_DEVICES_LATE: async disabled, doing synchronous restore for pid %d\n", pid);
+		return resume_device(pid, 1, CUDA_TASK_RUNNING);
+	}
+
+	pthread_mutex_lock(&async_restore_lock);
+
+	/* Check if current task is already in async list */
+	bool current_task_in_async = false;
+	list_for_each_entry(task, &async_restore_tasks, list) {
+		if (task->pid == pid) {
+			current_task_in_async = true;
+			break;
+		}
+	}
+
+	/* If not triggered yet, OR if current task wasn't found by Option A, scan for more */
+	if (!async_restore_triggered || !current_task_in_async) {
+		struct pstree_item *item;
+		int cuda_task_count = 0;
+
+		pr_err("OPTION_B: First CUDA task (pid %d) triggering async restore for other tasks\n", pid);
+		async_restore_triggered = true;
+		pthread_mutex_unlock(&async_restore_lock);
+
+		/* Scan all tasks and start async restore for CUDA tasks (except this one) */
+		for_each_pstree_item(item) {
+			int restore_tid;
+			struct async_restore_task *new_task;
+			bool already_in_list = false;
+
+			if (!task_alive(item))
+				continue;
+
+			/* Skip the current pid - we'll restore it synchronously */
+			if (item->pid->real == pid) {
+				pr_err("OPTION_B: Skipping pid %d (current task)\n", pid);
+				continue;
+			}
+
+			/* Check if this task is already in async list (from Option A) */
+			pthread_mutex_lock(&async_restore_lock);
+			list_for_each_entry(task, &async_restore_tasks, list) {
+				if (task->pid == item->pid->real) {
+					already_in_list = true;
+					break;
+				}
+			}
+			pthread_mutex_unlock(&async_restore_lock);
+
+			if (already_in_list) {
+				pr_err("OPTION_B: pid %d already in async list, skipping\n", item->pid->real);
+				continue;
+			}
+
+			/* Check if this task has CUDA */
+			restore_tid = get_cuda_restore_tid(item->pid->real);
+			if (restore_tid == -1) {
+				continue;
+			}
+
+			pr_err("OPTION_B: Found NEW CUDA task pid=%d, starting async restore\n", item->pid->real);
+
+			/* Start async restore for this task */
+			new_task = xmalloc(sizeof(*new_task));
+			if (new_task == NULL) {
+				pr_err("OPTION_B: Failed to allocate async task for pid %d\n", item->pid->real);
+				continue;
+			}
+
+			new_task->pid = item->pid->real;
+			new_task->result = 0;
+			new_task->started = false;
+			new_task->completed = false;
+
+			pthread_mutex_lock(&async_restore_lock);
+			list_add_tail(&new_task->list, &async_restore_tasks);
+			pthread_mutex_unlock(&async_restore_lock);
+
+			if (pthread_create(&new_task->thread, NULL, async_restore_thread, new_task) != 0) {
+				pr_perror("OPTION_B: Failed to create async thread for pid %d", item->pid->real);
+			} else {
+				new_task->started = true;
+				cuda_task_count++;
+			}
+		}
+
+		pr_err("OPTION_B: Started async restore for %d additional CUDA tasks\n", cuda_task_count);
+		pthread_mutex_lock(&async_restore_lock);
+	}
+
+	/* Wait for async restore to complete if it was started */
+	list_for_each_entry(task, &async_restore_tasks, list) {
+		if (task->pid == pid) {
+			pthread_mutex_unlock(&async_restore_lock);
+
+			if (task->started) {
+				pr_info("RESUME_DEVICES_LATE: waiting for async restore of pid %d\n", pid);
+				pthread_join(task->thread, NULL);
+				ret = task->result;
+				pr_info("RESUME_DEVICES_LATE: async restore of pid %d completed with result %d\n", pid,
+					ret);
+			} else {
+				/* Async restore wasn't started, do it synchronously */
+				pr_info("RESUME_DEVICES_LATE: performing synchronous restore of pid %d\n", pid);
+				ret = resume_device(pid, 1, CUDA_TASK_RUNNING);
+			}
+
+			return ret;
+		}
+	}
+	pthread_mutex_unlock(&async_restore_lock);
+
+	/* If no async task was registered, do synchronous restore */
+	pr_info("RESUME_DEVICES_LATE: no async task found for pid %d, doing synchronous restore\n", pid);
 	return resume_device(pid, 1, CUDA_TASK_RUNNING);
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_devices_late)
@@ -602,6 +960,11 @@ int cuda_plugin_init(int stage)
 		INIT_LIST_HEAD(&cuda_pids);
 	}
 
+	/* In the RESTORE stage, initialize async restore task list */
+	if (stage == CR_PLUGIN_STAGE__RESTORE) {
+		INIT_LIST_HEAD(&async_restore_tasks);
+	}
+
 	set_compel_interrupt_only_mode();
 
 	return 0;
@@ -615,6 +978,21 @@ void cuda_plugin_fini(int stage, int ret)
 
 	pr_info("finished %s stage %d err %d\n", CR_PLUGIN_DESC.name, stage, ret);
 
+	/* Print timing summary */
+	pr_info("==== CUDA Plugin Timing Summary ====\n");
+	pr_info("  PAUSE_DEVICES:      %lu us\n", g_timing_stats.pause_devices_us);
+	pr_info("  CHECKPOINT_DEVICES: %lu us\n", g_timing_stats.checkpoint_devices_us);
+	pr_info("  RESUME_DEVICES:     %lu us\n", g_timing_stats.resume_devices_us);
+	pr_info("  cuda-checkpoint calls: %lu (total time: %lu us)\n", g_timing_stats.total_cuda_checkpoint_calls,
+		g_timing_stats.total_cuda_checkpoint_us);
+	pr_info("  TOTAL PLUGIN TIME:  %lu us (%.3f seconds)\n",
+		g_timing_stats.pause_devices_us + g_timing_stats.checkpoint_devices_us +
+			g_timing_stats.resume_devices_us,
+		(g_timing_stats.pause_devices_us + g_timing_stats.checkpoint_devices_us +
+		 g_timing_stats.resume_devices_us) /
+			1000000.0);
+	pr_info("====================================\n");
+
 	/* Release all the paused PID's at the end of the DUMP stage in case the
 	 * user provides the -R (leave-running) flag or an error occurred
 	 */
@@ -627,5 +1005,10 @@ void cuda_plugin_fini(int stage, int ret)
 	if (stage == CR_PLUGIN_STAGE__DUMP) {
 		dealloc_pid_buffer(&cuda_pids);
 	}
+
+	if (stage == CR_PLUGIN_STAGE__RESTORE) {
+		dealloc_async_restore_tasks();
+	}
 }
 CR_PLUGIN_REGISTER("cuda_plugin", cuda_plugin_init, cuda_plugin_fini)
+

@@ -16,6 +16,16 @@
 static inline bool iov_grow_page(struct iovec *iov, unsigned long addr)
 {
 	if ((unsigned long)iov->iov_base + iov->iov_len == addr) {
+		/* Check if adding another page would exceed max iovec size */
+		if (opts.max_iovec_mb > 0) {
+			unsigned long max_iovec_bytes = (unsigned long)opts.max_iovec_mb * 1024UL * 1024UL;
+			if (iov->iov_len + PAGE_SIZE > max_iovec_bytes) {
+				/* Hit max size limit, force new iovec */
+				pr_debug("Iovec reached max size (%lu MB), creating new iovec\n",
+					 iov->iov_len / (1024UL * 1024UL));
+				return false;
+			}
+		}
 		iov->iov_len += PAGE_SIZE;
 		return true;
 	}

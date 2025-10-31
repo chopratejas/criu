@@ -44,6 +44,7 @@
 #include "restorer.h"
 #include "aio.h"
 #include "seccomp.h"
+#include "cr-errno.h"
 
 #include "images/creds.pb-c.h"
 #include "images/mm.pb-c.h"
@@ -59,8 +60,18 @@
 /*
  * Memory overhead limit for reading VMA when auto_dedup is enabled.
  * An arbitrarily chosen trade-off point between speed and memory usage.
+ * Increased from 128MB to 256MB for better batching and fewer syscalls.
  */
-#define AUTO_DEDUP_OVERHEAD_BYTES (128 << 20)
+#define AUTO_DEDUP_OVERHEAD_BYTES (256 << 20)
+
+/* madvise() flags for optimizing page loading */
+#ifndef MADV_SEQUENTIAL
+#define MADV_SEQUENTIAL 2
+#endif
+
+#ifndef MADV_WILLNEED
+#define MADV_WILLNEED 3
+#endif
 
 #ifndef PR_SET_PDEATHSIG
 #define PR_SET_PDEATHSIG 1
@@ -90,7 +101,84 @@
 		__ret;                                                          \
 	})
 
+/*
+ * Worker arguments for parallel VMA loading
+ */
+struct vma_worker_args {
+	int worker_id;
+	int num_workers;  /* Keep for backwards compatibility and logging */
+	int vma_ios_fd;
+	struct restore_vma_io *vma_ios;
+	unsigned int vma_ios_n;
+	bool auto_dedup;
+	futex_t *completion_futex;
+	struct task_entries *task_entries;
+	/* Chunk-based work assignment */
+	struct vma_chunk_info *chunks;  /* Array of all chunks */
+	int chunk_start;                /* First chunk index for this worker */
+	int chunk_count;                /* Number of chunks assigned to this worker */
+};
+
+/*
+ * Chunk information for iovec-level load balancing
+ * Each chunk represents a contiguous range of iovecs to be processed by one worker
+ */
+struct vma_chunk_info {
+	int vma_idx;           /* Which VMA this chunk belongs to */
+	int iov_start;         /* Starting iovec index within the VMA */
+	int iov_count;         /* Number of iovecs in this chunk */
+	unsigned long bytes;   /* Total bytes in this chunk */
+	loff_t file_offset;    /* Starting offset in pages file */
+};
+
+/*
+ * Simplified clone macro for spawning workers
+ * Based on RUN_CLONE_RESTORE_FN - properly handles function pointers in PIE code
+ */
+#define SPAWN_WORKER(ret, clone_flags, stack_ptr, worker_fn, worker_arg)		\
+	do {										\
+		long __ret;								\
+		void *__stack = (void *)(stack_ptr);					\
+		unsigned long __flags = (unsigned long)(clone_flags);			\
+		void *__fn = (void *)(worker_fn);					\
+		void *__arg = (void *)(worker_arg);					\
+		asm volatile(								\
+			"movq %[stack], %%rsi			\n"			\
+			"subq $16, %%rsi			\n"			\
+			"movq %[arg], %%rdi			\n"			\
+			"movq %%rdi, 8(%%rsi)			\n"			\
+			"movq %[fn], %%rdi			\n"			\
+			"movq %%rdi, 0(%%rsi)			\n"			\
+			"movq %[flags], %%rdi			\n"			\
+			"xorq %%rdx, %%rdx			\n"			\
+			"xorq %%r10, %%r10			\n"			\
+			"movl $"__stringify(__NR_clone)", %%eax	\n"			\
+			"syscall				\n"			\
+										\
+			"testq %%rax,%%rax			\n"			\
+			"jz 1f					\n"			\
+										\
+			"movq %%rax, %[out]			\n"			\
+			"jmp 2f					\n"			\
+										\
+			"1:					\n"			\
+			"xorq %%rbp, %%rbp			\n"			\
+			"popq %%rax				\n"			\
+			"popq %%rdi				\n"			\
+			"callq *%%rax				\n"			\
+										\
+			"2:					\n"			\
+			: [out] "=r"(__ret)						\
+			: [flags] "g"(__flags),						\
+			  [stack] "g"(__stack),						\
+			  [fn] "g"(__fn),						\
+			  [arg] "g"(__arg)						\
+			: "rax", "rcx", "rdi", "rsi", "rdx", "r10", "r11", "memory");	\
+		ret = __ret;								\
+	} while (0)
+
 static struct task_entries *task_entries_local;
+static struct vma_worker_args global_worker_args[32]; /* Global for CLONE_VM children */
 static futex_t thread_inprogress;
 static pid_t *helpers;
 static int n_helpers;
@@ -140,9 +228,13 @@ static void sigchld_handler(int signal, siginfo_t *siginfo, void *data)
 
 	/* We can ignore helpers that die, we expect them to after
 	 * CR_STATE_RESTORE is finished. */
-	for (i = 0; i < n_helpers; i++)
+	for (i = 0; i < n_helpers; i++) {
+		/* Skip sentinel PIDs (-1) used during worker pre-registration */
+		if (helpers[i] == -1)
+			continue;
 		if (siginfo->si_pid == helpers[i])
 			return;
+	}
 
 	for (i = 0; i < n_zombies; i++)
 		if (siginfo->si_pid == zombies[i])
@@ -1436,6 +1528,10 @@ static int wait_helpers(struct task_restore_args *task_args)
 		int status;
 		pid_t pid = task_args->helpers[i];
 
+		/* Skip sentinel PIDs used during VMA worker pre-registration */
+		if (pid == -1 || pid == 0)
+			continue;
+
 		/* Check that a helper completed. */
 		if (sys_wait4(pid, &status, 0, NULL) == -ECHILD) {
 			/* It has been waited in sigchld_handler */
@@ -1563,6 +1659,301 @@ static int fd_poll(int inotify_fd)
 	struct timespec tmo = { 0, 0 };
 
 	return sys_ppoll(&pfd, 1, &tmo, NULL, sizeof(sigset_t));
+}
+
+/* Forward declaration */
+static ssize_t preadv_limited(int fd, struct iovec *iovs, int nr, off_t offs, size_t max_to_read);
+
+/*
+ * Compute chunk assignments for iovec-level load balancing
+ *
+ * This function divides the work of loading VMAs across workers by splitting
+ * large VMAs into multiple chunks at iovec boundaries. This provides much
+ * better load balancing than round-robin VMA distribution when VMA sizes are
+ * highly skewed (e.g., one 8GB VMA and many small ones).
+ *
+ * Algorithm:
+ * 1. Calculate total bytes across all VMAs
+ * 2. Determine target chunk size = total_bytes / num_workers
+ * 3. For each VMA, split it into chunks of ~target_chunk_size at iovec boundaries
+ * 4. Assign chunks to workers in round-robin fashion
+ *
+ * Returns: Number of chunks created (>= num_workers), or -1 on error
+ */
+static int compute_vma_chunks(struct restore_vma_io *vma_ios, unsigned int vma_ios_n,
+			      int num_workers, struct vma_chunk_info *chunks, int max_chunks)
+{
+	struct restore_vma_io *rio;
+	unsigned long total_bytes = 0;
+	unsigned long target_chunk_bytes;
+	int chunk_idx = 0;
+	int v, i;
+
+	/* Calculate total bytes across all VMAs */
+	rio = vma_ios;
+	for (v = 0; v < vma_ios_n; v++) {
+		for (i = 0; i < rio->nr_iovs; i++) {
+			total_bytes += rio->iovs[i].iov_len;
+		}
+		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
+	}
+
+	pr_info("=== VMA CHUNKING: total_bytes=%lu, num_workers=%d ===\n",
+		total_bytes, num_workers);
+
+	/* Edge case: no data to load */
+	if (total_bytes == 0) {
+		pr_warn("No VMA data to load!\n");
+		return 0;
+	}
+
+	/* Target chunk size (with minimum of 1MB to avoid too many tiny chunks) */
+	target_chunk_bytes = total_bytes / num_workers;
+	if (target_chunk_bytes < 1024 * 1024)
+		target_chunk_bytes = 1024 * 1024;
+
+	pr_info("VMA CHUNKING: target_chunk_bytes=%lu (%.2f MB)\n",
+		target_chunk_bytes, (double)target_chunk_bytes / (1024.0 * 1024.0));
+
+	/* Create chunks by splitting VMAs at iovec boundaries */
+	rio = vma_ios;
+	for (v = 0; v < vma_ios_n; v++) {
+		unsigned long vma_total_bytes = 0;
+		loff_t current_file_offset = rio->off;
+		int iov_start = 0;
+
+		/* Calculate total bytes in this VMA */
+		for (i = 0; i < rio->nr_iovs; i++) {
+			vma_total_bytes += rio->iovs[i].iov_len;
+		}
+
+		pr_debug("VMA %d: %d iovecs, %lu bytes (%.2f MB)\n",
+			 v, rio->nr_iovs, vma_total_bytes,
+			 (double)vma_total_bytes / (1024.0 * 1024.0));
+
+		/* Split this VMA into chunks */
+		while (iov_start < rio->nr_iovs) {
+			unsigned long chunk_bytes = 0;
+			int iov_count = 0;
+
+			/* Accumulate iovecs until we reach target_chunk_bytes */
+			for (i = iov_start; i < rio->nr_iovs; i++) {
+				unsigned long iov_len = rio->iovs[i].iov_len;
+
+				/* Always include at least one iovec per chunk */
+				if (iov_count > 0 && chunk_bytes + iov_len > target_chunk_bytes * 1.5) {
+					/* This iovec would make chunk too large, stop here */
+					break;
+				}
+
+				chunk_bytes += iov_len;
+				iov_count++;
+
+				/* If we've reached a good chunk size, stop here */
+				if (chunk_bytes >= target_chunk_bytes)
+					break;
+			}
+
+			/* Create chunk */
+			if (chunk_idx >= max_chunks) {
+				pr_err("Too many chunks! max_chunks=%d\n", max_chunks);
+				return -1;
+			}
+
+			chunks[chunk_idx].vma_idx = v;
+			chunks[chunk_idx].iov_start = iov_start;
+			chunks[chunk_idx].iov_count = iov_count;
+			chunks[chunk_idx].bytes = chunk_bytes;
+			chunks[chunk_idx].file_offset = current_file_offset;
+
+			pr_debug("  Chunk %d: VMA %d, iovs [%d..%d) (%d iovs), %lu bytes (%.2f MB), file_offset=%lld\n",
+				 chunk_idx, v, iov_start, iov_start + iov_count, iov_count,
+				 chunk_bytes, (double)chunk_bytes / (1024.0 * 1024.0),
+				 (long long)current_file_offset);
+
+			chunk_idx++;
+			iov_start += iov_count;
+			current_file_offset += chunk_bytes;
+		}
+
+		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
+	}
+
+	pr_info("VMA CHUNKING: created %d chunks for %d workers\n", chunk_idx, num_workers);
+
+	/* Verify total bytes match */
+	{
+		unsigned long chunk_total = 0;
+		for (i = 0; i < chunk_idx; i++) {
+			chunk_total += chunks[i].bytes;
+		}
+		if (chunk_total != total_bytes) {
+			pr_err("Chunk accounting error! chunk_total=%lu != total_bytes=%lu\n",
+			       chunk_total, total_bytes);
+			return -1;
+		}
+	}
+
+	return chunk_idx;
+}
+
+/*
+ * Worker function for parallel VMA loading with chunk-based load balancing
+ * Each worker processes a set of chunks assigned to it.
+ */
+static long vma_loading_worker(void *arg)
+{
+	struct vma_worker_args *wargs = (struct vma_worker_args *)arg;
+	pid_t my_pid = sys_getpid();
+	unsigned long total_bytes = 0, total_syscalls = 0;
+	struct timespec worker_start, worker_end;
+	int chunk_idx;
+
+	sys_clock_gettime(CLOCK_MONOTONIC, &worker_start);
+	pr_info("===== WORKER %d ENTRY: PID=%d, chunks=[%d..%d) (%d chunks), chunks_ptr=%p =====\n",
+		wargs->worker_id, my_pid, wargs->chunk_start,
+		wargs->chunk_start + wargs->chunk_count, wargs->chunk_count, wargs->chunks);
+
+	/* Validate wargs before proceeding */
+	if (!wargs->chunks) {
+		pr_err("Worker %d: chunks pointer is NULL!\n", wargs->worker_id);
+		atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EINVAL);
+		sys_exit(1);
+	}
+
+	/* Calculate total bytes assigned to this worker */
+	{
+		unsigned long worker_bytes = 0;
+		for (chunk_idx = wargs->chunk_start; chunk_idx < wargs->chunk_start + wargs->chunk_count; chunk_idx++) {
+			worker_bytes += wargs->chunks[chunk_idx].bytes;
+		}
+		pr_info("Worker %d: assigned %.2f MB across %d chunks\n",
+			wargs->worker_id, (double)worker_bytes / (1024.0 * 1024.0),
+			wargs->chunk_count);
+	}
+
+	/* Process each assigned chunk */
+	for (chunk_idx = wargs->chunk_start; chunk_idx < wargs->chunk_start + wargs->chunk_count; chunk_idx++) {
+		struct vma_chunk_info *chunk = &wargs->chunks[chunk_idx];
+		struct restore_vma_io *rio;
+		struct iovec local_iovs[IOV_MAX]; /* Local copy to avoid corrupting shared memory */
+		struct iovec *iovs = local_iovs;
+		int nr = chunk->iov_count;
+		int j;
+		unsigned long chunk_bytes_read = 0;
+		loff_t offset = chunk->file_offset;
+
+		pr_debug("Worker %d: processing chunk %d (VMA %d, iovs [%d..%d), %.2f MB, file_offset=%lld)\n",
+			 wargs->worker_id, chunk_idx, chunk->vma_idx,
+			 chunk->iov_start, chunk->iov_start + chunk->iov_count,
+			 (double)chunk->bytes / (1024.0 * 1024.0),
+			 (long long)offset);
+
+		/* Find the VMA for this chunk */
+		if (chunk->vma_idx >= wargs->vma_ios_n) {
+			pr_err("Worker %d: Invalid vma_idx %d >= %d\n",
+			       wargs->worker_id, chunk->vma_idx, wargs->vma_ios_n);
+			atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EINVAL);
+			sys_exit(1);
+		}
+
+		rio = wargs->vma_ios;
+		for (j = 0; j < chunk->vma_idx; j++) {
+			rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
+		}
+
+		/* Copy the relevant iovecs to local storage */
+		if (chunk->iov_count > IOV_MAX) {
+			pr_err("Worker %d: Too many iovecs in chunk (%d > %d)\n",
+			       wargs->worker_id, chunk->iov_count, IOV_MAX);
+			atomic_cmpxchg(&wargs->task_entries->cr_err, 0, E2BIG);
+			sys_exit(1);
+		}
+
+		/* Validate iovec range */
+		if (chunk->iov_start + chunk->iov_count > rio->nr_iovs) {
+			pr_err("Worker %d: Invalid iovec range [%d..%d) exceeds rio->nr_iovs=%d\n",
+			       wargs->worker_id, chunk->iov_start,
+			       chunk->iov_start + chunk->iov_count, rio->nr_iovs);
+			atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EINVAL);
+			sys_exit(1);
+		}
+
+		for (j = 0; j < chunk->iov_count; j++) {
+			local_iovs[j] = rio->iovs[chunk->iov_start + j];
+		}
+
+		/* Load data for this chunk */
+		while (nr > 0) {
+			ssize_t r = preadv_limited(wargs->vma_ios_fd, iovs, nr, offset,
+						    wargs->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
+			if (r < 0) {
+				pr_err("Worker %d (PID %d): Can't read pages data for chunk %d (%d)\n",
+				       wargs->worker_id, my_pid, chunk_idx, (int)r);
+				atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EIO);
+				sys_exit(1);
+			}
+
+			chunk_bytes_read += r;
+			total_syscalls++;
+
+			/* Punch holes if auto_dedup enabled */
+			if (r > 0 && wargs->auto_dedup) {
+				int fr = sys_fallocate(wargs->vma_ios_fd,
+						       FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+						       offset, r);
+				if (fr < 0) {
+					pr_debug("Worker %d: Failed to punch holes: %d\n",
+						 wargs->worker_id, fr);
+				}
+			}
+
+			offset += r;
+
+			/* Advance iovecs */
+			do {
+				if (iovs->iov_len <= r) {
+					r -= iovs->iov_len;
+					iovs++;
+					nr--;
+					continue;
+				}
+				iovs->iov_base += r;
+				iovs->iov_len -= r;
+				break;
+			} while (nr > 0);
+		}
+
+		total_bytes += chunk_bytes_read;
+
+		/* Verify we read the expected amount */
+		if (chunk_bytes_read != chunk->bytes) {
+			pr_warn("Worker %d: chunk %d read mismatch: expected %lu, got %lu\n",
+				wargs->worker_id, chunk_idx, chunk->bytes, chunk_bytes_read);
+		}
+	}
+
+	sys_clock_gettime(CLOCK_MONOTONIC, &worker_end);
+	{
+		long elapsed_us = (worker_end.tv_sec - worker_start.tv_sec) * 1000000L +
+				  (worker_end.tv_nsec - worker_start.tv_nsec) / 1000L;
+		pr_info("Worker %d (PID %d): completed VMA loading. %lu bytes, %lu syscalls, %ld us, %.2f MB/s\n",
+			wargs->worker_id, my_pid, total_bytes, total_syscalls, elapsed_us,
+			elapsed_us > 0 ? ((double)total_bytes / (1024.0 * 1024.0)) / ((double)elapsed_us / 1000000.0) : 0.0);
+	}
+
+	/* Signal completion and exit */
+	pr_info("Worker %d (PID %d): signaling completion via futex\n", wargs->worker_id, my_pid);
+	futex_dec_and_wake(wargs->completion_futex);
+
+	pr_info("Worker %d (PID %d): work complete, exiting\n", wargs->worker_id, my_pid);
+
+	/* Exit worker. Since this is PIE code and we were cloned with CLONE_VM,
+	 * we must call sys_exit() to properly terminate this thread of execution.
+	 * The parent process has registered us as a helper, so SIGCHLD will be ignored. */
+	sys_exit(0);
+
+	return 0; /* Never reached */
 }
 
 /*
@@ -1729,6 +2120,12 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	rt_sigaction_t act;
 	bool has_vdso_proxy;
 
+	/* Timing instrumentation for memory restore */
+	struct timespec mem_restore_start, mem_restore_end;
+	struct timespec vma_start, vma_end;
+	struct timespec preadv_start, preadv_end;
+	unsigned long total_mem_bytes = 0, total_mem_syscalls = 0;
+
 	bootstrap_start = args->bootstrap_start;
 	bootstrap_len = args->bootstrap_len;
 
@@ -1883,31 +2280,299 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			pr_err("Can't restore %" PRIx64 " mapping with %lx\n", vma_entry->start, va);
 			goto core_restore_end;
 		}
+
+		/*
+		 * Hint to kernel for optimized page loading:
+		 * MADV_SEQUENTIAL: optimize for sequential access patterns
+		 * MADV_WILLNEED: pre-fault and readahead pages
+		 */
+		sys_madvise((unsigned long)decode_pointer(vma_entry->start), vma_entry_len(vma_entry), MADV_SEQUENTIAL);
+		sys_madvise((unsigned long)decode_pointer(vma_entry->start), vma_entry_len(vma_entry), MADV_WILLNEED);
 	}
 
 	/*
 	 * Now read the contents (if any)
 	 */
 
+	/* Start timing memory restore */
+	sys_clock_gettime(CLOCK_MONOTONIC, &mem_restore_start);
+
+	pr_info("=== PIE RESTORER: VMA loading decision point ===\n");
+	pr_info("PIE: args->vma_parallel_workers = %d\n", args->vma_parallel_workers);
+	pr_info("PIE: args->vma_ios_n = %d\n", args->vma_ios_n);
+	pr_info("PIE: args->vma_ios_fd = %d\n", args->vma_ios_fd);
+	pr_info("PIE: args->helpers_n = %d\n", args->helpers_n);
+	pr_info("PIE: args->max_helpers = %d\n", args->max_helpers);
+
+	/* Parallel VMA loading if workers configured */
+	if (args->vma_parallel_workers > 0 && args->vma_ios_n > 1) {
+		int num_workers = args->vma_parallel_workers;
+		pid_t worker_pids[32]; /* Max 32 workers */
+		struct vma_worker_args *worker_args = global_worker_args; /* Use global for CLONE_VM access */
+		void *worker_stacks[32];
+		futex_t worker_completion;
+		k_rtsigset_t sigchld_mask, old_mask;
+		int w, i, worker_base_idx;
+		struct vma_chunk_info chunks[256];  /* Max 256 chunks (reduce to save stack space) */
+		int num_chunks, chunks_per_worker, leftover_chunks;
+
+		pr_info("PIE: *** ENTERING PARALLEL VMA LOADING PATH ***\n");
+
+		if (num_workers > 32)
+			num_workers = 32;
+		if (num_workers > args->vma_ios_n)
+			num_workers = args->vma_ios_n;
+
+		pr_info("===== STARTING PARALLEL VMA LOADING =====\n");
+		pr_info("Using %d parallel workers for %d VMAs\n", num_workers, args->vma_ios_n);
+		pr_info("vma_ios_fd=%d, auto_dedup=%d\n", args->vma_ios_fd, args->auto_dedup);
+
+		/* Initialize completion futex */
+		pr_info("Initializing completion futex to %d\n", num_workers);
+		futex_set(&worker_completion, num_workers);
+		pr_info("Completion futex initialized, value=%d\n", futex_get(&worker_completion));
+
+		/* Allocate stacks for workers (32KB each) */
+		pr_info("Allocating %d worker stacks (%d bytes each)\n", num_workers, RESTORE_STACK_SIZE);
+		for (w = 0; w < num_workers; w++) {
+			worker_stacks[w] = (void *)sys_mmap(NULL, RESTORE_STACK_SIZE,
+							    PROT_READ | PROT_WRITE,
+							    MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+			if (worker_stacks[w] == (void *)-1) {
+				pr_err("Failed to allocate worker stack %d\n", w);
+				goto core_restore_end;
+			}
+			pr_info("Allocated stack %d at %p\n", w, worker_stacks[w]);
+		}
+
+		/*
+		 * Verify we have enough pre-allocated helper slots
+		 */
+		if (args->helpers_n + num_workers > args->max_helpers) {
+			pr_err("Not enough helper slots pre-allocated! Current=%d, adding=%d, max=%d\n",
+			       args->helpers_n, num_workers, args->max_helpers);
+			goto core_restore_end;
+		}
+
+		/*
+		 * COMPUTE CHUNK ASSIGNMENTS for load balancing
+		 * Split large VMAs into chunks at iovec boundaries to distribute work evenly
+		 */
+		pr_info("Computing chunk assignments for load balancing...\n");
+		num_chunks = compute_vma_chunks(args->vma_ios, args->vma_ios_n,
+						num_workers, chunks, 256);
+		if (num_chunks < 0) {
+			pr_err("Failed to compute VMA chunks\n");
+			goto core_restore_end;
+		}
+		if (num_chunks == 0) {
+			pr_warn("No chunks computed, nothing to load\n");
+			goto vma_loading_done;
+		}
+
+		pr_info("Computed %d chunks for %d workers\n", num_chunks, num_workers);
+		pr_info("Chunks array address: %p, size: %lu bytes\n", chunks, sizeof(chunks));
+
+		/* Dump first few chunks for debugging */
+		for (i = 0; i < num_chunks && i < 5; i++) {
+			pr_info("  chunks[%d]: vma_idx=%d, iov_start=%d, iov_count=%d, bytes=%lu\n",
+				i, chunks[i].vma_idx, chunks[i].iov_start,
+				chunks[i].iov_count, chunks[i].bytes);
+		}
+
+		/* Distribute chunks evenly across workers (round-robin) */
+		chunks_per_worker = num_chunks / num_workers;
+		leftover_chunks = num_chunks % num_workers;
+		pr_info("Base chunks per worker: %d, leftover: %d\n",
+			chunks_per_worker, leftover_chunks);
+
+		/*
+		 * CRITICAL SECTION: Pre-register workers in helpers array BEFORE spawning
+		 * to prevent race with SIGCHLD handler. We block SIGCHLD during spawn+register.
+		 *
+		 * Race condition without this:
+		 * 1. Spawn worker
+		 * 2. Worker exits quickly (before step 3)
+		 * 3. SIGCHLD fires, handler checks helpers[] - doesn't find worker!
+		 * 4. Handler aborts restore
+		 *
+		 * Solution: Pre-register with sentinel PIDs, then update after spawn.
+		 */
+		worker_base_idx = args->helpers_n;
+
+		/* Pre-register workers with sentinel PID (-1) */
+		pr_info("Pre-registering %d worker slots at index %d\n", num_workers, worker_base_idx);
+		for (w = 0; w < num_workers; w++) {
+			args->helpers[worker_base_idx + w] = -1;  /* Sentinel: not yet spawned */
+		}
+
+		/* Update helpers_n and n_helpers with memory barrier */
+		args->helpers_n += num_workers;
+		__asm__ __volatile__("mfence" ::: "memory");  /* Full memory barrier */
+		n_helpers += num_workers;
+		pr_info("Updated helpers_n=%d, n_helpers=%d\n", args->helpers_n, n_helpers);
+
+		/* Block SIGCHLD to prevent handler from running during spawn+register */
+		ksigemptyset(&sigchld_mask);
+		ksigaddset(&sigchld_mask, SIGCHLD);
+		ret = sys_sigprocmask(SIG_BLOCK, &sigchld_mask, &old_mask, sizeof(k_rtsigset_t));
+		if (ret) {
+			pr_err("Failed to block SIGCHLD: %ld\n", ret);
+			goto core_restore_end;
+		}
+		pr_info("SIGCHLD blocked for spawn+register critical section\n");
+
+		/* Spawn workers and update their PIDs in the helpers array */
+		pr_info("Spawning %d workers...\n", num_workers);
+		for (w = 0; w < num_workers; w++) {
+			int chunk_start, chunk_count;
+
+			pr_info("Setting up worker %d args...\n", w);
+
+			/* Assign chunk range to this worker (round-robin) */
+			chunk_start = w * chunks_per_worker + (w < leftover_chunks ? w : leftover_chunks);
+			chunk_count = chunks_per_worker + (w < leftover_chunks ? 1 : 0);
+
+			worker_args[w].worker_id = w;
+			worker_args[w].num_workers = num_workers;
+			worker_args[w].vma_ios_fd = args->vma_ios_fd;
+			worker_args[w].vma_ios = args->vma_ios;
+			worker_args[w].vma_ios_n = args->vma_ios_n;
+			worker_args[w].auto_dedup = args->auto_dedup;
+			worker_args[w].completion_futex = &worker_completion;
+			worker_args[w].task_entries = task_entries_local;
+			worker_args[w].chunks = chunks;
+			worker_args[w].chunk_start = chunk_start;
+			worker_args[w].chunk_count = chunk_count;
+
+			pr_info("Worker %d: assigned chunks [%d..%d) (%d chunks), chunks_ptr=%p\n",
+				w, chunk_start, chunk_start + chunk_count, chunk_count, chunks);
+
+			/* Validate chunk assignments */
+			if (chunk_count > 0 && chunk_start + chunk_count > num_chunks) {
+				pr_err("Worker %d: Invalid chunk range [%d..%d) exceeds num_chunks=%d\n",
+				       w, chunk_start, chunk_start + chunk_count, num_chunks);
+				goto core_restore_end;
+			}
+
+			pr_info("Calling SPAWN_WORKER for worker %d (stack=%p, fn=%p, arg=%p)...\n",
+				w, (void *)((unsigned long)worker_stacks[w] + RESTORE_STACK_SIZE),
+				vma_loading_worker, &worker_args[w]);
+
+			/* Spawn worker using inline assembly clone */
+			/* Note: Using CLONE_VM | CLONE_FILES | SIGCHLD for proper parent/child relationship */
+			SPAWN_WORKER(worker_pids[w],
+				     CLONE_VM | CLONE_FILES | SIGCHLD,
+				     (void *)((unsigned long)worker_stacks[w] + RESTORE_STACK_SIZE),
+				     vma_loading_worker,
+				     &worker_args[w]);
+
+			if (worker_pids[w] < 0) {
+				pr_err("SPAWN_WORKER failed for worker %d: returned %ld\n", w, (long)worker_pids[w]);
+				/* Restore signal mask before error exit */
+				sys_sigprocmask(SIG_SETMASK, &old_mask, NULL, sizeof(k_rtsigset_t));
+				goto core_restore_end;
+			}
+
+			/* Update the pre-registered sentinel PID with real PID */
+			args->helpers[worker_base_idx + w] = worker_pids[w];
+			__asm__ __volatile__("mfence" ::: "memory");  /* Ensure write is visible */
+
+			pr_info("*** Spawned worker %d with PID %d, registered at helpers[%d] ***\n",
+				w, worker_pids[w], worker_base_idx + w);
+		}
+
+		/* Restore previous signal mask (unblock SIGCHLD) */
+		ret = sys_sigprocmask(SIG_SETMASK, &old_mask, NULL, sizeof(k_rtsigset_t));
+		if (ret) {
+			pr_err("Failed to restore signal mask: %ld\n", ret);
+			goto core_restore_end;
+		}
+		pr_info("SIGCHLD unblocked - workers can now exit safely\n");
+		pr_info("All %d workers spawned and registered successfully\n", num_workers);
+
+		/* Wait for all workers to complete memory loading */
+		pr_info("Waiting for %d workers to complete memory loading via futex...\n", num_workers);
+		futex_wait_until(&worker_completion, 0);
+		pr_info("All workers signaled memory loading completion via futex\n");
+
+		/* Check if any worker set error flag during loading */
+		if (atomic_read(&task_entries_local->cr_err)) {
+			pr_err("Worker set error during VMA loading: %d\n", atomic_read(&task_entries_local->cr_err));
+			goto core_restore_end;
+		}
+
+		/*
+		 * CRITICAL: Reap workers IMMEDIATELY to free their PIDs.
+		 * Workers use CLONE_VM (shared memory), so memory is already loaded.
+		 * We must reap them NOW because their PIDs might conflict with PIDs
+		 * needed for thread restoration later (via last_pid manipulation).
+		 */
+		pr_info("Reaping %d workers immediately to free PIDs...\n", num_workers);
+		for (w = 0; w < num_workers; w++) {
+			int status;
+			pid_t pid = worker_pids[w];
+			long wait_ret = sys_wait4(pid, &status, 0, NULL);
+
+			if (wait_ret < 0) {
+				pr_err("Failed to wait for worker %d (PID %d): %ld\n", w, pid, wait_ret);
+				/* Continue anyway - worker might have been reaped by SIGCHLD handler */
+			} else if (!WIFEXITED(status) || WEXITSTATUS(status)) {
+				pr_err("Worker %d (PID %d) exited abnormally: status=%d, signal=%d\n",
+				       w, pid, WEXITSTATUS(status), WTERMSIG(status));
+				goto core_restore_end;
+			} else {
+				pr_info("Worker %d (PID %d) reaped successfully\n", w, pid);
+			}
+
+			/* Clear the PID from helpers array since we've already reaped it */
+			args->helpers[worker_base_idx + w] = -1;
+		}
+		pr_info("All %d workers reaped. PIDs freed for reuse.\n", num_workers);
+
+		/* Skip sequential code - memory already loaded by workers */
+		goto vma_loading_done;
+	} else {
+		pr_info("PIE: Using SEQUENTIAL VMA loading (workers=%d, vma_ios_n=%d)\n",
+			args->vma_parallel_workers, args->vma_ios_n);
+	}
+
+	/* Sequential VMA loading (original code) */
 	rio = args->vma_ios;
 	for (i = 0; i < args->vma_ios_n; i++) {
+		unsigned long vma_bytes = 0, vma_syscalls = 0;
 		struct iovec *iovs = rio->iovs;
 		int nr = rio->nr_iovs;
 		ssize_t r;
 
+		sys_clock_gettime(CLOCK_MONOTONIC, &vma_start);
+
 		while (nr) {
+			long preadv_us;
 			pr_debug("Preadv %lx:%d... (%d iovs)\n", (unsigned long)iovs->iov_base, (int)iovs->iov_len, nr);
 			/*
 			 * If we're requested to punch holes in the file after reading we do
 			 * it to save memory. Limit the reads then to an arbitrary block size.
 			 */
+			sys_clock_gettime(CLOCK_MONOTONIC, &preadv_start);
 			r = preadv_limited(args->vma_ios_fd, iovs, nr, rio->off,
 					   args->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
+			sys_clock_gettime(CLOCK_MONOTONIC, &preadv_end);
+
+			preadv_us = (preadv_end.tv_sec - preadv_start.tv_sec) * 1000000L +
+				    (preadv_end.tv_nsec - preadv_start.tv_nsec) / 1000L;
+
 			if (r < 0) {
 				pr_err("Can't read pages data (%d)\n", (int)r);
 				goto core_restore_end;
 			}
 
+			pr_info("preadv: %ld bytes, %d iovs, %ld us, %.2f MB/s\n",
+				(long)r, nr, preadv_us,
+				preadv_us > 0 ? ((double)r / (1024.0 * 1024.0)) / ((double)preadv_us / 1000000.0) : 0.0);
+
+			vma_bytes += r;
+			vma_syscalls++;
 			pr_debug("`- returned %ld\n", (long)r);
 			/* If the file is open for writing, then it means we should punch holes
 			 * in it. */
@@ -1935,7 +2600,40 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			} while (nr > 0);
 		}
 
+		/* VMA timing summary */
+		sys_clock_gettime(CLOCK_MONOTONIC, &vma_end);
+		{
+			long vma_us = (vma_end.tv_sec - vma_start.tv_sec) * 1000000L +
+				      (vma_end.tv_nsec - vma_start.tv_nsec) / 1000L;
+			pr_info("VMA %d: %lu bytes, %lu syscalls, %ld us, %.2f MB/s\n",
+				i, vma_bytes, vma_syscalls, vma_us,
+				vma_us > 0 ? ((double)vma_bytes / (1024.0 * 1024.0)) / ((double)vma_us / 1000000.0) : 0.0);
+			total_mem_bytes += vma_bytes;
+			total_mem_syscalls += vma_syscalls;
+		}
+
 		rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
+	}
+
+vma_loading_done:
+	/* Total memory restore timing summary */
+	sys_clock_gettime(CLOCK_MONOTONIC, &mem_restore_end);
+	{
+		long total_us = (mem_restore_end.tv_sec - mem_restore_start.tv_sec) * 1000000L +
+				(mem_restore_end.tv_nsec - mem_restore_start.tv_nsec) / 1000L;
+		pr_info("==== PIE Restorer Memory Timing ====\n");
+		pr_info("  Total bytes read:      %lu (%.2f MB)\n",
+			total_mem_bytes, (double)total_mem_bytes / (1024.0 * 1024.0));
+		pr_info("  Total syscalls:        %lu\n", total_mem_syscalls);
+		pr_info("  Total time:            %ld us (%.3f seconds)\n",
+			total_us, (double)total_us / 1000000.0);
+		pr_info("  Average throughput:    %.2f MB/s\n",
+			total_us > 0 ? ((double)total_mem_bytes / (1024.0 * 1024.0)) / ((double)total_us / 1000000.0) : 0.0);
+		if (total_mem_syscalls > 0) {
+			pr_info("  Avg bytes per syscall: %lu\n", total_mem_bytes / total_mem_syscalls);
+			pr_info("  Avg time per syscall:  %ld us\n", total_us / total_mem_syscalls);
+		}
+		pr_info("======================================\n");
 	}
 
 	if (args->vma_ios_fd != -1)

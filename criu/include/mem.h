@@ -58,4 +58,6 @@ struct page_info {
 
 int should_dump_page(pmc_t *pmc, VmaEntry *vmae, u64 vaddr, struct page_info *page_info);
 
+extern void print_mem_timing_stats(void);
+
 #endif /* __CR_MEM_H__ */

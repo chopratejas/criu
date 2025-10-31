@@ -189,6 +189,7 @@ struct task_restore_args {
 
 	pid_t *helpers /* the TASK_HELPERS to wait on at the end of restore */;
 	unsigned int helpers_n;
+	unsigned int max_helpers; /* Maximum number of helpers pre-allocated (including space for VMA workers) */
 
 	pid_t *zombies;
 	unsigned int zombies_n;
@@ -226,6 +227,7 @@ struct task_restore_args {
 
 	bool can_map_vdso;
 	bool auto_dedup;
+	unsigned int vma_parallel_workers; /* Number of parallel workers for VMA loading (0 = sequential) */
 	unsigned long vdso_rt_size;
 	struct vdso_maps vdso_maps_rt;	 /* runtime vdso symbols */
 	unsigned long vdso_rt_parked_at; /* safe place to keep vdso */

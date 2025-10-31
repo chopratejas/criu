@@ -247,6 +247,12 @@ struct cr_options {
 	 * explicitly request it as it comes with many limitations.
 	 */
 	int unprivileged;
+
+	/* Number of parallel workers for VMA loading during restore (0 = sequential) */
+	int vma_parallel_workers;
+
+	/* Maximum size of a single iovec during checkpoint/restore in MB (0 = unlimited) */
+	int max_iovec_mb;
 };
 
 extern struct cr_options opts;

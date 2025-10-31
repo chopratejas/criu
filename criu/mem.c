@@ -36,6 +36,72 @@
 #include "protobuf.h"
 #include "images/pagemap.pb-c.h"
 
+/* Memory restore timing infrastructure */
+struct mem_timing_stats {
+	unsigned long premap_vmas_us;
+	unsigned long restore_content_us;
+	unsigned long read_pages_us;
+	unsigned long memcpy_us;
+	unsigned long vma_lookup_us;
+	unsigned long sync_us;
+	unsigned long read_pages_calls;
+	unsigned long memcpy_calls;
+	unsigned long total_pages_read;
+	unsigned long total_bytes_read;
+};
+
+static struct mem_timing_stats g_mem_timing = { 0 };
+
+static inline unsigned long timespec_diff_us_mem(struct timespec *start, struct timespec *end)
+{
+	return (end->tv_sec - start->tv_sec) * 1000000UL + (end->tv_nsec - start->tv_nsec) / 1000UL;
+}
+
+#define MEM_TIMING_START(var) struct timespec var; clock_gettime(CLOCK_MONOTONIC, &var)
+#define MEM_TIMING_END(var, accum)                                                                                     \
+	do {                                                                                                           \
+		struct timespec __end;                                                                                 \
+		clock_gettime(CLOCK_MONOTONIC, &__end);                                                               \
+		accum += timespec_diff_us_mem(&var, &__end);                                                           \
+	} while (0)
+
+void print_mem_timing_stats(void)
+{
+	unsigned long total_us = g_mem_timing.premap_vmas_us + g_mem_timing.restore_content_us;
+
+	pr_info("==== Memory Restore Timing Summary ====\n");
+	pr_info("  premap_priv_vmas:        %10lu us (%6.2f%%)\n", g_mem_timing.premap_vmas_us,
+		total_us > 0 ? (g_mem_timing.premap_vmas_us * 100.0 / total_us) : 0.0);
+	pr_info("  restore_priv_vma_content:%10lu us (%6.2f%%)\n", g_mem_timing.restore_content_us,
+		total_us > 0 ? (g_mem_timing.restore_content_us * 100.0 / total_us) : 0.0);
+	pr_info("    ├─ read_pages:         %10lu us (%6.2f%% of content)\n", g_mem_timing.read_pages_us,
+		g_mem_timing.restore_content_us > 0 ? (g_mem_timing.read_pages_us * 100.0 / g_mem_timing.restore_content_us) : 0.0);
+	pr_info("    ├─ memcpy:             %10lu us (%6.2f%% of content)\n", g_mem_timing.memcpy_us,
+		g_mem_timing.restore_content_us > 0 ? (g_mem_timing.memcpy_us * 100.0 / g_mem_timing.restore_content_us) : 0.0);
+	pr_info("    └─ sync:               %10lu us (%6.2f%% of content)\n", g_mem_timing.sync_us,
+		g_mem_timing.restore_content_us > 0 ? (g_mem_timing.sync_us * 100.0 / g_mem_timing.restore_content_us) : 0.0);
+	pr_info("  TOTAL MEMORY RESTORE:    %10lu us (%6.2f seconds)\n", total_us, total_us / 1000000.0);
+	pr_info("\n");
+	pr_info("  Statistics:\n");
+	pr_info("    read_pages calls:      %10lu\n", g_mem_timing.read_pages_calls);
+	pr_info("    total pages read:      %10lu\n", g_mem_timing.total_pages_read);
+	pr_info("    total bytes read:      %10lu (%6.2f MB)\n", g_mem_timing.total_bytes_read,
+		g_mem_timing.total_bytes_read / (1024.0 * 1024.0));
+	if (g_mem_timing.read_pages_calls > 0) {
+		pr_info("    avg time per call:     %10lu ns\n",
+			(g_mem_timing.read_pages_us * 1000) / g_mem_timing.read_pages_calls);
+		pr_info("    avg pages per call:    %10lu\n",
+			g_mem_timing.total_pages_read / g_mem_timing.read_pages_calls);
+	}
+	if (g_mem_timing.total_bytes_read > 0 && g_mem_timing.read_pages_us > 0) {
+		double throughput_mbps = (g_mem_timing.total_bytes_read / (1024.0 * 1024.0)) /
+					 (g_mem_timing.read_pages_us / 1000000.0);
+		pr_info("    read throughput:       %10.2f MB/s\n", throughput_mbps);
+	}
+	pr_info("    memcpy calls:          %10lu\n", g_mem_timing.memcpy_calls);
+	pr_info("=======================================\n");
+}
+
 static int task_reset_dirty_track(int pid)
 {
 	int ret;
@@ -1059,6 +1125,7 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 	unsigned long pstart = 0;
 	int ret = 0;
 	LIST_HEAD(empty);
+	MEM_TIMING_START(premap_start);
 
 	filemap_ctx_init(true);
 
@@ -1113,6 +1180,8 @@ static int premap_priv_vmas(struct pstree_item *t, struct vm_area_list *vmas, vo
 
 	filemap_ctx_fini();
 
+	MEM_TIMING_END(premap_start, g_mem_timing.premap_vmas_us);
+	pr_debug("premap_priv_vmas completed in %lu us\n", g_mem_timing.premap_vmas_us);
 	return ret;
 }
 
@@ -1130,6 +1199,9 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	unsigned int nr_enqueued = 0;
 	unsigned int nr_lazy = 0;
 	unsigned long va;
+	struct timespec restore_content_start, read_start, memcpy_start, read_async_start, sync_start;
+
+	clock_gettime(CLOCK_MONOTONIC, &restore_content_start);
 
 	vma = list_first_entry(vmas, struct vma_area, list);
 	rsti(t)->pages_img_id = pr->pages_img_id;
@@ -1219,7 +1291,12 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 			if (vma_inherited(vma)) {
 				clear_bit(off, vma->pvma->page_bitmap);
 
+				clock_gettime(CLOCK_MONOTONIC, &read_start);
 				ret = pr->read_pages(pr, va, 1, buf, 0);
+				MEM_TIMING_END(read_start, g_mem_timing.read_pages_us);
+				g_mem_timing.read_pages_calls++;
+				g_mem_timing.total_pages_read++;
+				g_mem_timing.total_bytes_read += PAGE_SIZE;
 				if (ret < 0)
 					goto err_read;
 
@@ -1232,7 +1309,10 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 				}
 
 				nr_restored++;
+				clock_gettime(CLOCK_MONOTONIC, &memcpy_start);
 				memcpy(p, buf, PAGE_SIZE);
+				MEM_TIMING_END(memcpy_start, g_mem_timing.memcpy_us);
+				g_mem_timing.memcpy_calls++;
 			} else {
 				int nr;
 
@@ -1247,7 +1327,12 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 
 				nr = min_t(int, nr_pages - i, (vma->e->end - va) / PAGE_SIZE);
 
+				clock_gettime(CLOCK_MONOTONIC, &read_async_start);
 				ret = pr->read_pages(pr, va, nr, p, PR_ASYNC);
+				MEM_TIMING_END(read_async_start, g_mem_timing.read_pages_us);
+				g_mem_timing.read_pages_calls++;
+				g_mem_timing.total_pages_read += nr;
+				g_mem_timing.total_bytes_read += nr * PAGE_SIZE;
 				if (ret < 0)
 					goto err_read;
 
@@ -1261,8 +1346,10 @@ static int restore_priv_vma_content(struct pstree_item *t, struct page_read *pr)
 	}
 
 err_read:
+	clock_gettime(CLOCK_MONOTONIC, &sync_start);
 	if (pr->sync(pr))
 		return -1;
+	MEM_TIMING_END(sync_start, g_mem_timing.sync_us);
 
 	pr->close(pr);
 	if (ret < 0)
@@ -1306,6 +1393,13 @@ err_read:
 	pr_info("nr_dropped_pages:  %d\n", nr_dropped);
 	pr_info("nr_enqueued:       %d\n", nr_enqueued);
 	pr_info("nr_lazy:           %d\n", nr_lazy);
+
+	MEM_TIMING_END(restore_content_start, g_mem_timing.restore_content_us);
+	pr_info("restore_priv_vma_content completed in %lu us\n", g_mem_timing.restore_content_us);
+	pr_info("  - read_pages: %lu us (%lu calls, %lu pages, %lu bytes)\n", g_mem_timing.read_pages_us,
+		g_mem_timing.read_pages_calls, g_mem_timing.total_pages_read, g_mem_timing.total_bytes_read);
+	pr_info("  - memcpy: %lu us (%lu calls)\n", g_mem_timing.memcpy_us, g_mem_timing.memcpy_calls);
+	pr_info("  - sync: %lu us\n", g_mem_timing.sync_us);
 
 	return 0;
 

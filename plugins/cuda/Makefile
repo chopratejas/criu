@@ -11,6 +11,7 @@ PLUGIN_INCLUDE  	+= -iquote../../
 COMPEL := ../../compel/compel-host
 
 PLUGIN_CFLAGS := -g -Wall -Werror -shared -nostartfiles -fPIC
+PLUGIN_LDFLAGS := -lpthread
 
 __nmk_dir ?= ../../scripts/nmk/scripts/
 include $(__nmk_dir)msg.mk
@@ -38,3 +39,4 @@ uninstall:
 	$(E) " UNINSTALL" $(PLUGIN_NAME)
 	$(Q) $(RM) $(DESTDIR)$(PLUGINDIR)/$(PLUGIN_SOBJ)
 .PHONY: uninstall
+
