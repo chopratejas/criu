@@ -2305,7 +2305,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	pr_info("PIE: args->max_helpers = %d\n", args->max_helpers);
 
 	/* Parallel VMA loading if workers configured */
-	if (args->vma_parallel_workers > 0 && args->vma_ios_n > 1) {
+	if (args->vma_parallel_workers > 0 && args->vma_ios_n >= 1) {
 		int num_workers = args->vma_parallel_workers;
 		pid_t worker_pids[32]; /* Max 32 workers */
 		struct vma_worker_args *worker_args = global_worker_args; /* Use global for CLONE_VM access */

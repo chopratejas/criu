@@ -807,7 +807,7 @@ int cuda_plugin_resume_devices_late(int pid)
 		async_restore_triggered = true;
 		pthread_mutex_unlock(&async_restore_lock);
 
-		/* Scan all tasks and start async restore for CUDA tasks (except this one) */
+		/* Scan all tasks and start async restore for CUDA tasks (INCLUDING this one) */
 		for_each_pstree_item(item) {
 			int restore_tid;
 			struct async_restore_task *new_task;
@@ -815,12 +815,6 @@ int cuda_plugin_resume_devices_late(int pid)
 
 			if (!task_alive(item))
 				continue;
-
-			/* Skip the current pid - we'll restore it synchronously */
-			if (item->pid->real == pid) {
-				pr_err("OPTION_B: Skipping pid %d (current task)\n", pid);
-				continue;
-			}
 
 			/* Check if this task is already in async list (from Option A) */
 			pthread_mutex_lock(&async_restore_lock);

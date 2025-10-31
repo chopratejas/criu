@@ -2425,20 +2425,12 @@ int cr_restore_tasks(void)
 			return -1;
 	}
 
-	/* HARDCODED FOR TESTING: Force VMA parallel workers = 4 */
+	/* HARDCODED: Force VMA parallel workers = 8 and max iovec size = 256MB */
 	{
-		pr_info("=== VMA PARALLEL WORKERS: HARDCODED TEST MODE ===\n");
-		opts.vma_parallel_workers = 4;
-		pr_info("VMA PARALLEL: *** HARDCODED TO 4 WORKERS FOR TESTING ***\n");
-		pr_info("VMA PARALLEL: Final opts.vma_parallel_workers = %d\n", opts.vma_parallel_workers);
-	}
-
-	/* HARDCODED FOR TESTING: Force max iovec size = 256MB */
-	{
-		pr_info("=== MAX IOVEC SIZE: HARDCODED TEST MODE ===\n");
+		opts.vma_parallel_workers = 8;
 		opts.max_iovec_mb = 256;
-		pr_info("MAX IOVEC: *** HARDCODED TO 256 MB FOR TESTING ***\n");
-		pr_info("MAX IOVEC: Final opts.max_iovec_mb = %d MB\n", opts.max_iovec_mb);
+		pr_info("VMA PARALLEL: Using %d workers (hardcoded)\n", opts.vma_parallel_workers);
+		pr_info("MAX IOVEC: Using %d MB limit (hardcoded)\n", opts.max_iovec_mb);
 	}
 
 	if (prepare_task_entries() < 0)
