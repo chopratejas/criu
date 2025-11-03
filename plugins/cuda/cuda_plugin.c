@@ -777,9 +777,8 @@ int cuda_plugin_resume_devices_late(int pid)
 		return -ENOTSUP;
 	}
 
-	/* OPTION B: If async restore wasn't triggered by POST_FORKING, OR if this task
-	 * wasn't found by Option A, trigger async restore for remaining tasks.
-	 * This catches tasks that were forked after POST_FORKING.
+	/* Wait for async restore if it was started by OPTION_A (POST_FORKING hook).
+	 * If not in async list, fall back to synchronous restore.
 	 */
 	if (!async_restore_enabled) {
 		/* Baseline mode: no async restore, do everything synchronously */
@@ -789,85 +788,7 @@ int cuda_plugin_resume_devices_late(int pid)
 
 	pthread_mutex_lock(&async_restore_lock);
 
-	/* Check if current task is already in async list */
-	bool current_task_in_async = false;
-	list_for_each_entry(task, &async_restore_tasks, list) {
-		if (task->pid == pid) {
-			current_task_in_async = true;
-			break;
-		}
-	}
-
-	/* If not triggered yet, OR if current task wasn't found by Option A, scan for more */
-	if (!async_restore_triggered || !current_task_in_async) {
-		struct pstree_item *item;
-		int cuda_task_count = 0;
-
-		pr_err("OPTION_B: First CUDA task (pid %d) triggering async restore for other tasks\n", pid);
-		async_restore_triggered = true;
-		pthread_mutex_unlock(&async_restore_lock);
-
-		/* Scan all tasks and start async restore for CUDA tasks (INCLUDING this one) */
-		for_each_pstree_item(item) {
-			int restore_tid;
-			struct async_restore_task *new_task;
-			bool already_in_list = false;
-
-			if (!task_alive(item))
-				continue;
-
-			/* Check if this task is already in async list (from Option A) */
-			pthread_mutex_lock(&async_restore_lock);
-			list_for_each_entry(task, &async_restore_tasks, list) {
-				if (task->pid == item->pid->real) {
-					already_in_list = true;
-					break;
-				}
-			}
-			pthread_mutex_unlock(&async_restore_lock);
-
-			if (already_in_list) {
-				pr_err("OPTION_B: pid %d already in async list, skipping\n", item->pid->real);
-				continue;
-			}
-
-			/* Check if this task has CUDA */
-			restore_tid = get_cuda_restore_tid(item->pid->real);
-			if (restore_tid == -1) {
-				continue;
-			}
-
-			pr_err("OPTION_B: Found NEW CUDA task pid=%d, starting async restore\n", item->pid->real);
-
-			/* Start async restore for this task */
-			new_task = xmalloc(sizeof(*new_task));
-			if (new_task == NULL) {
-				pr_err("OPTION_B: Failed to allocate async task for pid %d\n", item->pid->real);
-				continue;
-			}
-
-			new_task->pid = item->pid->real;
-			new_task->result = 0;
-			new_task->started = false;
-			new_task->completed = false;
-
-			pthread_mutex_lock(&async_restore_lock);
-			list_add_tail(&new_task->list, &async_restore_tasks);
-			pthread_mutex_unlock(&async_restore_lock);
-
-			if (pthread_create(&new_task->thread, NULL, async_restore_thread, new_task) != 0) {
-				pr_perror("OPTION_B: Failed to create async thread for pid %d", item->pid->real);
-			} else {
-				new_task->started = true;
-				cuda_task_count++;
-			}
-		}
-
-		pr_err("OPTION_B: Started async restore for %d additional CUDA tasks\n", cuda_task_count);
-		pthread_mutex_lock(&async_restore_lock);
-	}
-
-	/* Wait for async restore to complete if it was started */
+	/* Check if task is in async list (started by OPTION_A/POST_FORKING) and wait for it */
 	list_for_each_entry(task, &async_restore_tasks, list) {
 		if (task->pid == pid) {
 			pthread_mutex_unlock(&async_restore_lock);
