@@ -283,15 +283,122 @@ int exec_rpc_query_external_files(char *name, int sk)
 	return ret;
 }
 
-static char images_dir[PATH_MAX];
+static int resolve_images_dir_path(char *images_dir_path,
+				   bool imgs_changed_by_rpc_conf,
+				   const CriuOpts *req,
+				   pid_t peer_pid)
+{
+	/*
+	 * images_dir_fd is a required RPC parameter with -1 as default value.
+	 *
+	 * This assumes that if opts.imgs_dir is set, we have a value
+	 * from the configuration file parser. The test to see that
+	 * imgs_changed_by_rpc_conf is true is used to make sure the value
+	 * is from the RPC configuration file. The idea is that only the
+	 * RPC configuration file is able to overwrite RPC settings:
+	 *  * apply_config(global_conf)
+	 *  * apply_config(user_conf)
+	 *  * apply_config(environment variable)
+	 *  * apply_rpc_options()
+	 *  * apply_config(rpc_conf)
+	 */
+	if (imgs_changed_by_rpc_conf) {
+		strncpy(images_dir_path, opts.imgs_dir, PATH_MAX - 1);
+		images_dir_path[PATH_MAX - 1] = '\0';
+	} else if (req->images_dir_fd != -1) {
+		snprintf(images_dir_path, PATH_MAX, "/proc/%d/fd/%d", peer_pid, req->images_dir_fd);
+	} else if (req->images_dir) {
+		strncpy(images_dir_path, req->images_dir, PATH_MAX - 1);
+		images_dir_path[PATH_MAX - 1] = '\0';
+	} else {
+		/*
+		 * Since images dir is not required in CHECK mode, we need to
+		 * check for work_dir_fd in setup_images_and_workdir()
+		 */
+		if (opts.mode == CR_CHECK)
+			return 0;
+		pr_err("Neither images_dir_fd nor images_dir was passed by RPC client.\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int setup_images_and_workdir(const char *images_dir_path,
+				    bool work_changed_by_rpc_conf,
+				    CriuOpts *req,
+				    pid_t peer_pid)
+{
+	char work_dir_path[PATH_MAX] = "";
+
+	/* We don't need to open images dir in CHECK mode. */
+	if (opts.mode != CR_CHECK) {
+		/*
+		 * Image streaming is not supported with CRIU's service feature as
+		 * the streamer must be started for each dump/restore operation.
+		 * It is unclear how to do that with RPC, so we punt for now.
+		 * This explains why we provide the argument mode=-1 instead of
+		 * O_RSTR or O_DUMP.
+		 */
+		if (open_image_dir(images_dir_path, -1) < 0) {
+			pr_perror("Can't open images directory");
+			return -1;
+		}
+	}
+
+	if (work_changed_by_rpc_conf)
+		strncpy(work_dir_path, opts.work_dir, PATH_MAX - 1);
+	else if (req->has_work_dir_fd)
+		sprintf(work_dir_path, "/proc/%d/fd/%d", peer_pid, req->work_dir_fd);
+	else if (opts.work_dir)
+		strncpy(work_dir_path, opts.work_dir, PATH_MAX - 1);
+	else if (images_dir_path[0] != '\0')
+		strcpy(work_dir_path, images_dir_path);
+
+	if (work_dir_path[0] == '\0') {
+		pr_err("images-dir or work-dir is required when using log file\n");
+		return -1;
+	}
+
+	if (chdir(work_dir_path)) {
+		pr_perror("Can't chdir to work_dir");
+		return -1;
+	}
+
+	return 0;
+}
+
+static int setup_logging_from_req(CriuOpts *req, bool output_changed_by_rpc_conf)
+{
+	if (req->log_file && !output_changed_by_rpc_conf) {
+		if (strchr(req->log_file, '/')) {
+			pr_perror("No subdirs are allowed in log_file name");
+			return -1;
+		}
+		SET_CHAR_OPTS(output, req->log_file);
+	} else if (req->has_log_to_stderr && req->log_to_stderr && !output_changed_by_rpc_conf) {
+		xfree(opts.output);
+		opts.output = NULL; /* log_init(NULL) writes to stderr */
+	} else if (!opts.output) {
+		SET_CHAR_OPTS(output, DEFAULT_LOG_FILENAME);
+	}
+
+	opts.log_level = req->log_level;
+	log_set_loglevel(opts.log_level);
+	if (log_init(opts.output)) {
+		pr_perror("Can't initiate log");
+		return -1;
+	}
+
+	return 0;
+}
 
 static int setup_opts_from_req(int sk, CriuOpts *req)
 {
 	struct ucred ids;
 	struct stat st;
 	socklen_t ids_len = sizeof(struct ucred);
-	char images_dir_path[PATH_MAX];
-	char work_dir_path[PATH_MAX];
+	char images_dir_path[PATH_MAX] = "";
 	char status_fd[PATH_MAX];
 	bool output_changed_by_rpc_conf = false;
 	bool work_changed_by_rpc_conf = false;
@@ -302,6 +409,23 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	if (getsockopt(sk, SOL_SOCKET, SO_PEERCRED, &ids, &ids_len)) {
 		pr_perror("Can't get socket options");
 		goto err;
+	}
+
+	/*
+	 * The options relevant in CHECK mode are: log_file, log_to_stderr, and log_level.
+	 * When logging to a file, we also need to resolve images_dir and work_dir.
+	 */
+	if (opts.mode == CR_CHECK) {
+		if (!req)
+			return 0; /* nothing to do */
+
+		/*
+		 * A log file is needed only if:
+		 *   - log_file is explicitly set, or
+		 *   - log_to_stderr is NOT requested (i.e., using DEFAULT_LOG_FILENAME)
+		 */
+		if (!req->log_file || (req->has_log_to_stderr && req->log_to_stderr))
+			return 0; /* no log file, don't require images_dir or work_dir */
 	}
 
 	if (fstat(sk, &st)) {
@@ -673,65 +797,14 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 		xfree(tmp_work);
 	}
 
-	/*
-	 * open images_dir - images_dir_fd is a required RPC parameter
-	 *
-	 * This assumes that if opts.imgs_dir is set we have a value
-	 * from the configuration file parser. The test to see that
-	 * imgs_changed_by_rpc_conf is true is used to make sure the value
-	 * is from the RPC configuration file. The idea is that only the
-	 * RPC configuration file is able to overwrite RPC settings:
-	 *  * apply_config(global_conf)
-	 *  * apply_config(user_conf)
-	 *  * apply_config(environment variable)
-	 *  * apply_rpc_options()
-	 *  * apply_config(rpc_conf)
-	 */
-	if (imgs_changed_by_rpc_conf) {
-		strncpy(images_dir_path, opts.imgs_dir, PATH_MAX - 1);
-	} else if (req->images_dir_fd != -1) {
-		sprintf(images_dir_path, "/proc/%d/fd/%d", ids.pid, req->images_dir_fd);
-	} else if (req->images_dir) {
-		strncpy(images_dir_path, req->images_dir, PATH_MAX - 1);
-	} else {
-		pr_err("Neither images_dir_fd nor images_dir was passed by RPC client.\n");
+	if (resolve_images_dir_path(images_dir_path, imgs_changed_by_rpc_conf, req, ids.pid) < 0)
 		goto err;
-	}
 
 	if (req->parent_img)
 		SET_CHAR_OPTS(img_parent, req->parent_img);
 
-	/*
-	 * Image streaming is not supported with CRIU's service feature as
-	 * the streamer must be started for each dump/restore operation.
-	 * It is unclear how to do that with RPC, so we punt for now.
-	 * This explains why we provide the argument mode=-1 instead of
-	 * O_RSTR or O_DUMP.
-	 */
-	if (open_image_dir(images_dir_path, -1) < 0) {
-		pr_perror("Can't open images directory");
+	if (setup_images_and_workdir(images_dir_path, work_changed_by_rpc_conf, req, ids.pid))
 		goto err;
-	}
-
-	/* get full path to images_dir to use in process title */
-	if (readlink(images_dir_path, images_dir, PATH_MAX) == -1) {
-		pr_perror("Can't readlink %s", images_dir_path);
-		goto err;
-	}
-
-	if (work_changed_by_rpc_conf)
-		strncpy(work_dir_path, opts.work_dir, PATH_MAX - 1);
-	else if (req->has_work_dir_fd)
-		sprintf(work_dir_path, "/proc/%d/fd/%d", ids.pid, req->work_dir_fd);
-	else if (opts.work_dir)
-		strncpy(work_dir_path, opts.work_dir, PATH_MAX - 1);
-	else
-		strcpy(work_dir_path, images_dir_path);
-
-	if (chdir(work_dir_path)) {
-		pr_perror("Can't chdir to work_dir");
-		goto err;
-	}
 
 	if (req->n_irmap_scan_paths) {
 		for (i = 0; i < req->n_irmap_scan_paths; i++) {
@@ -741,36 +814,12 @@ static int setup_opts_from_req(int sk, CriuOpts *req)
 	}
 
 	/* initiate log file in work dir */
-	if (req->log_file && !output_changed_by_rpc_conf) {
-		/*
-		 * If RPC sets a log file and if there nothing from the
-		 * RPC configuration file, use the RPC value.
-		 */
-		if (strchr(req->log_file, '/')) {
-			pr_perror("No subdirs are allowed in log_file name");
-			goto err;
-		}
-
-		SET_CHAR_OPTS(output, req->log_file);
-	} else if (req->has_log_to_stderr && req->log_to_stderr && !output_changed_by_rpc_conf) {
-		xfree(opts.output);
-		opts.output = NULL;
-	} else if (!opts.output) {
-		SET_CHAR_OPTS(output, DEFAULT_LOG_FILENAME);
-	}
-
-	/* This is needed later to correctly set the log_level */
-	opts.log_level = req->log_level;
-	log_set_loglevel(req->log_level);
-	if (log_init(opts.output) == -1) {
-		pr_perror("Can't initiate log");
+	if (setup_logging_from_req(req, output_changed_by_rpc_conf))
 		goto err;
-	}
 
 	if (req->mntns_compat_mode)
 		opts.mntns_compat_mode = true;
 
-	log_set_loglevel(opts.log_level);
 	if (check_options())
 		goto err;
 
@@ -790,7 +839,7 @@ static int dump_using_req(int sk, CriuOpts *req)
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
-	__setproctitle("dump --rpc -t %d -D %s", req->pid, images_dir);
+	__setproctitle("dump --rpc -t %d", req->pid);
 
 	if (init_pidfd_store_hash())
 		goto pidfd_store_err;
@@ -833,7 +882,7 @@ static int restore_using_req(int sk, CriuOpts *req)
 	if (setup_opts_from_req(sk, req))
 		goto exit;
 
-	__setproctitle("restore --rpc -D %s", images_dir);
+	__setproctitle("restore --rpc");
 
 	if (cr_restore_tasks())
 		goto exit;
@@ -928,7 +977,7 @@ static int pre_dump_using_req(int sk, CriuOpts *req, bool single)
 		if (setup_opts_from_req(sk, req))
 			goto cout;
 
-		__setproctitle("pre-dump --rpc -t %d -D %s", req->pid, images_dir);
+		__setproctitle("pre-dump --rpc -t %d", req->pid);
 
 		if (init_pidfd_store_hash())
 			goto pidfd_store_err;
@@ -1264,8 +1313,7 @@ static int handle_cpuinfo(int sk, CriuReq *msg)
 		if (setup_opts_from_req(sk, msg->opts))
 			goto cout;
 
-		__setproctitle("cpuinfo %s --rpc -D %s", msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ? "dump" : "check",
-			       images_dir);
+		__setproctitle("cpuinfo %s --rpc", msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP ? "dump" : "check");
 
 		if (msg->type == CRIU_REQ_TYPE__CPUINFO_DUMP)
 			ret = cpuinfo_dump();
