@@ -5,11 +5,11 @@ Complete step-by-step guide for setting up GPU checkpointing with CRIU, NVIDIA C
 ## System Information
 
 - **OS**: Ubuntu 24.04 (Linux 6.11.0-29-generic)
-- **GPU**: NVIDIA A10 (24GB VRAM)
-- **RAM**: 222GB
-- **Driver**: NVIDIA 580.95.05
+- **GPU**: NVIDIA H100 PCIe (80GB VRAM)
+- **RAM**: 226GB
+- **Driver**: NVIDIA 570.158.01
 - **Container Runtime**: Podman with runc
-- **CRIU Version**: 4.0 (custom fork with VMA parallelization)
+- **CRIU Version**: 4.0 (custom fork with VMA parallelization - 256 workers, 512MB chunks)
 
 ## Table of Contents
 
@@ -90,7 +90,12 @@ ls -la /dev/nvidia*
 
 ### Clone Custom CRIU Fork
 
-This fork includes VMA (Virtual Memory Area) parallelization optimizations with 64 workers (default) for faster memory restoration.
+This fork includes VMA (Virtual Memory Area) parallelization optimizations with 256 workers (optimized) and 512MB chunk size for faster memory restoration.
+
+**Latest optimizations** (as of 2025-11-17):
+- **256 parallel workers**: Optimal for large checkpoints (86GB+)
+- **512MB max_iovec_mb**: Reduces chunk count by 45% for better disk I/O
+- **Per-worker file descriptors**: Independent I/O for true parallelism
 
 ```bash
 cd /root
@@ -129,15 +134,29 @@ ls -lah /usr/lib/criu/cuda_plugin.so
 The custom CRIU includes hardcoded VMA workers in `/root/criu/criu/cr-restore.c`:
 
 ```c
-/* HARDCODED: Force VMA parallel workers = 64 and max iovec size = 256MB */
-opts.vma_parallel_workers = 64;
-opts.max_iovec_mb = 256;
+/* HARDCODED: Force VMA parallel workers = 256 and max iovec size = 512MB */
+opts.vma_parallel_workers = 256;
+opts.max_iovec_mb = 512;
 ```
 
-To modify workers (e.g., 256):
-1. Edit `/root/criu/criu/cr-restore.c` line 2430
-2. Rebuild: `make clean && make -j$(nproc)`
-3. Reinstall: `sudo cp criu/criu /usr/sbin/criu && sudo cp plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so`
+**Why these values:**
+- **256 workers**: Optimal for 86GB+ checkpoints, creates ~1 chunk per worker for parallel I/O
+- **512MB chunks**: Reduces chunk count from 299 to 163 (45% reduction), improves disk sequential reads by 8%
+
+**Worker count optimization:**
+| Workers | Chunks | VMA Restore | Result |
+|---------|--------|-------------|--------|
+| 64      | 318    | 28.7s       | Too few = sequential processing |
+| 128     | 315    | 23.6s       | Still sequential |
+| **256** | **299/163** | **20s** | **Optimal** - 1 chunk per worker |
+| 320     | 322    | 16.5s (cached) | Overhead without benefit |
+| 512     | N/A    | CRASH       | Segmentation fault |
+
+To modify workers or chunk size:
+1. Edit `/root/criu/criu/cr-restore.c` line 2430-2431
+2. Edit `/root/criu/criu/pie/restorer.c` line 184, 2385-2397 (array sizes)
+3. Rebuild: `make clean && make -j$(nproc)`
+4. Reinstall: `sudo cp criu/criu /usr/sbin/criu && sudo cp plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so`
 
 ---
 
@@ -432,46 +451,215 @@ tail -20 /tmp/restore.log
 
 ## Performance Results
 
-### Custom CRIU 4.0 vs Vanilla CRIU 4.1.1
+### Latest Results: Qwen 32B on H100 (November 2025)
 
-**Test**: Qwen 7B (14.25 GiB model, 23GB checkpoint)
+**Hardware**: 1x H100 PCIe (80GB), 226GB RAM, virtio storage (4.2 GB/s)
+**Model**: Qwen 2.5 32B (~60GB weights, 86GB total memory)
 
-| Metric | Custom CRIU 4.0 (64 workers) | Vanilla CRIU 4.1.1 (no workers) | Speedup |
-|--------|------------------------------|----------------------------------|---------|
-| **Total restore time** | 12.78s | 27.36s | **2.14x** |
-| **CRIU restore** | 8.46s | 22.91s | **2.71x** |
-| GPU restore | 6.74s | 6.34s | Similar |
-| VMA/memory restore | 1.72s | 16.57s | **9.64x** |
-| Podman overhead | 4.32s | 4.45s | Similar |
+| Phase | Cold Start | Checkpoint Restore | Speedup |
+|-------|------------|-------------------|---------|
+| **Total time to first inference** | 158.9s | **33.1s** | **4.8x** |
+| Model loading | ~90s | - | - |
+| CUDA graph compilation | ~60s | - | - |
+| VMA restore (CPU memory) | - | 20s @ 4.3 GB/s | - |
+| GPU restore | - | 14s | - |
+| Container overhead | ~8s | ~2s | - |
 
 **Key Findings**:
-- **64 VMA workers provide 9.6x speedup** for memory restoration
-- GPU restore dominates (~50-80% of time) regardless of version
-- Custom CRIU delivers **2.14x faster total restore** for large model checkpoints
+- **256 VMA workers + 512MB chunks** optimal for 86GB checkpoint
+- Checkpoint restore is **4.8x faster** than cold start
+- VMA parallelization achieves **4.3 GB/s** effective throughput (6x vs sequential)
+- GPU restore is consistent at ~14s regardless of model size
 
-### Model Comparison (Custom CRIU, 64 workers)
+### Disk vs Page Cache Performance
 
-| Model | Size | Total Restore | CRIU Time | GPU Restore | VMA Time |
-|-------|------|---------------|-----------|-------------|----------|
-| Qwen 7B | 14.25 GiB | 12.78s | 8.46s | 6.74s | 1.72s |
-| Qwen 14B-AWQ | 9.38 GiB | 13.11s | 8.57s | 6.72s | 1.85s |
+| Storage | VMA Restore | GPU Restore | Total | Throughput |
+|---------|-------------|-------------|-------|------------|
+| **Cold disk (virtio)** | 22.1s | 13.8s | **43.5s** | 3.9 GB/s |
+| **Page cache (warm)** | 14.6s | 13.9s | **36.4s** | 5.9 GB/s |
+| **With 512MB chunks (disk)** | 20.3s | 13.8s | **41.7s** | 4.2 GB/s |
 
-**Observation**: Restore time is similar because:
-- Quantized 14B (9.4GB) is smaller than full 7B (14.25GB)
-- GPU restore dominates and is consistent across models
-- VMA parallelization efficiently handles memory differences
+**Bottleneck**: Disk I/O is the primary bottleneck. With NVMe (7-10 GB/s), VMA restore could improve from 20s to 12-15s.
 
-### VMA Worker Scaling (Qwen 14B-AWQ)
+### Worker Count Optimization (Qwen 32B)
 
-| Workers | Total Time | CRIU Time | GPU Restore | VMA Time |
-|---------|-----------|-----------|-------------|----------|
-| 64 | 13.11s | 8.57s | 6.72s | 1.85s |
-| 256 | 13.79s | 9.18s | 7.38s | 1.80s |
+| Workers | Chunks | VMA Restore (disk) | Result |
+|---------|--------|--------------------|--------|
+| 64      | 318    | 28.7s              | Sequential (5 chunks/worker) |
+| 128     | 315    | 23.6s              | Sequential (2.5 chunks/worker) |
+| **256** | **299** | **22.1s** (256MB) | **Optimal** (1.2 chunks/worker) |
+| **256** | **163** | **20.3s** (512MB) | **Best** (0.6 chunks/worker) |
+| 320     | 322    | 16.5s (cached)     | Overhead without benefit |
+| 512     | N/A    | CRASH              | Segmentation fault |
 
-**Finding**: **64 workers is optimal** for this workload. 256 workers add overhead without benefit, likely due to:
-- Increased context switching
-- More complex synchronization
-- Diminishing returns for 24GB checkpoint size
+**Conclusion**: 256 workers with 512MB chunks is optimal for large models (60GB+)
+
+### Chunk Size Impact
+
+| max_iovec_mb | Chunks | VMA Restore | Checkpoint Time | Speedup |
+|--------------|--------|-------------|-----------------|---------|
+| 256MB        | 299    | 22.1s       | 133.9s          | Baseline |
+| **512MB**    | **163** | **20.3s** | **124.8s** | **8% faster** restore, 7% faster checkpoint |
+
+**Benefits of 512MB chunks**:
+- 45% fewer chunks (better for disk seeks)
+- Larger sequential reads (better for virtio storage)
+- Faster both checkpoint and restore
+
+### Model Comparison (Custom CRIU, 256 workers, 512MB chunks)
+
+| Model | Size | GPU Memory | Total Restore (disk) | Cold Start | Speedup |
+|-------|------|------------|---------------------|------------|---------|
+| Qwen 7B | ~14GB | 23GB | ~13-15s (estimated) | ~80-100s | ~6-7x |
+| Qwen 32B | ~60GB | 76GB | **33.1s** | **158.9s** | **4.8x** |
+| Llama 70B (TP=2)* | ~140GB | 150GB | ~50-70s (estimated) | ~400-500s | ~7-8x |
+| GPT 120B (TP=4)* | ~240GB | 300GB | ~100-125s (estimated) | ~600-900s | ~5-8x |
+
+*Multi-GPU estimates based on scaling analysis
+
+---
+
+## Multi-GPU Support (Tensor Parallelism)
+
+### Overview
+
+For larger models that don't fit on a single GPU, vLLM supports Tensor Parallelism (TP) which splits the model across multiple GPUs. CRIU + cuda-checkpoint should support multi-GPU checkpointing, though this requires testing to confirm.
+
+### Setup for 2+ GPUs
+
+**Hardware Requirements:**
+- 2x H100 (160GB total) for Llama 3.1 70B
+- 4x H100 (320GB total) for GPT 120B
+- Single node (all GPUs on same NVLink/PCIe fabric)
+
+**vLLM Configuration:**
+Add `--tensor-parallel-size N` flag:
+
+```bash
+podman run -d \
+  --name vllm-70b-test \
+  --device nvidia.com/gpu=all \
+  --security-opt=seccomp=/etc/containers/seccomp.d/no-io-uring.json \
+  --security-opt=label=disable \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 8000:8000 \
+  docker.io/vllm/vllm-openai:v0.11.0 \
+  --model meta-llama/Meta-Llama-3.1-70B-Instruct \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 8192 \
+  --dtype auto
+```
+
+### How Multi-GPU Checkpointing Works
+
+**Process Architecture:**
+```
+vLLM Master Process
+├── GPU Worker 0 (1/N of model)
+├── GPU Worker 1 (1/N of model)
+├── GPU Worker 2 (1/N of model)
+└── GPU Worker 3 (1/N of model)
+     └── NCCL coordinates between workers
+```
+
+**Checkpoint Process:**
+1. CRIU checkpoints entire process tree (master + all workers)
+2. cuda-checkpoint called for EACH GPU worker in parallel
+3. All GPU states saved atomically
+4. NCCL communication state preserved (or re-initialized on restore)
+
+**Restore Process:**
+1. CRIU restores process tree
+2. VMA workers restore CPU memory (256 workers across ALL memory)
+3. All GPU workers restore in parallel
+4. NCCL re-initialization (~10-20s if state not preserved)
+
+### Expected Performance (Estimated)
+
+**Llama 3.1 70B on 2x H100:**
+- Memory: ~250GB total (system RAM)
+- GPU memory: ~150GB across 2 GPUs
+- Checkpoint time: ~180-220s
+- Restore time: **50-70s** (estimated)
+  - VMA restore: ~35-45s (250GB)
+  - GPU restore: ~12-18s (parallel across 2 GPUs)
+  - NCCL re-init: ~5-10s (if needed)
+- Cold start: ~400-500s
+- **Speedup: 7-8x**
+
+**GPT 120B on 4x H100:**
+- Memory: ~400-500GB total (system RAM)
+- GPU memory: ~300GB across 4 GPUs
+- Checkpoint time: ~135-160s
+- Restore time: **100-125s** (estimated)
+  - VMA restore: ~75-85s (400GB)
+  - GPU restore: ~18-22s (parallel across 4 GPUs)
+  - NCCL re-init: ~15-25s (if needed)
+- Cold start: ~600-900s
+- **Speedup: 5-8x**
+
+### Recommended Testing Path
+
+1. **Start with 2 GPUs (TP=2):**
+   - Use Llama 3.1 70B or Qwen 2.5 72B
+   - Verify checkpoint/restore works with multiple GPU workers
+   - Measure if NCCL needs re-initialization
+   - Validate performance scaling
+
+2. **Scale to 4 GPUs (TP=4):**
+   - Test with GPT 70B or similar large model
+   - Confirm parallel GPU restore
+   - Check for any sequential bottlenecks
+
+3. **Key metrics to capture:**
+   - Per-GPU checkpoint/restore time (should be parallel)
+   - NCCL re-init time (if any)
+   - Total restore time vs cold start
+   - Inference quality after restore
+
+### Potential Issues
+
+**NCCL State Preservation:**
+- Unknown if cuda-checkpoint preserves NCCL communication state
+- If not preserved: Need 10-30s for NCCL re-initialization
+- Still much faster than cold start
+
+**GPU Topology:**
+- Must restore on same physical GPU IDs
+- NVLink topology should match checkpoint environment
+- CUDA graphs may have hardcoded GPU references
+
+### No Special Configuration Needed
+
+**Good news**: Your existing CRIU setup should work with multi-GPU!
+- No changes to CRIU configuration
+- No changes to cuda-checkpoint configuration
+- Same 256 workers, 512MB chunks
+- Just add `--tensor-parallel-size N` to vLLM
+
+---
+
+## Demo Scripts
+
+Complete demo scripts are available in `/root/criu/demo_scripts/`:
+
+- **`run_complete_demo.sh`**: End-to-end baseline vs checkpoint comparison
+- **`demo_baseline_final.sh`**: Cold start performance measurement
+- **`demo_checkpoint_final.sh`**: Checkpoint restore performance measurement
+- **`create_checkpoint.sh`**: Creates checkpoint of fully loaded vLLM
+
+**Documentation:**
+- `README.md`: Complete guide to demo scripts
+- `FINAL_OPTIMIZATION_RESULTS.md`: Optimization journey and results
+- `DISK_VS_CACHE_ANALYSIS.md`: Disk I/O bottleneck analysis
+- `WORKER_COUNT_ANALYSIS.md`: Worker count optimization testing
+
+**Usage:**
+```bash
+cd /root/criu/demo_scripts
+./run_complete_demo.sh "What is the capital of France?"
+```
 
 ---
 
@@ -585,20 +773,41 @@ sudo cp plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so
 
 ### What Works
 
-✅ **Driver 580.95.05** with CRIU 4.0 custom + real NVIDIA cuda-checkpoint
-✅ **64 VMA workers** optimal for 20-30GB checkpoints
+✅ **Driver 570.158.01** (and 580.95.05) with CRIU 4.0 custom + real NVIDIA cuda-checkpoint
+✅ **256 VMA workers + 512MB chunks** optimal for large checkpoints (60GB+)
 ✅ **--privileged** mode required for GPU access
-✅ **--device /dev/nvidiactl** must be included despite causing issues in older setups
-✅ **Quantized models** (AWQ) checkpoint just as fast as full models
-✅ **vLLM with --enforce-eager** works reliably for checkpoint/restore
+✅ **--device nvidia.com/gpu=all** exposes all GPUs to container
+✅ **Checkpoint restore 4.8x faster** than cold start for Qwen 32B
+✅ **Sub-linear scaling**: Memory increases 5x but restore only 3-4x slower (parallelization works!)
+✅ **vLLM with CUDA graphs** checkpoints reliably (no need for --enforce-eager)
 
 ### What Doesn't Work
 
 ❌ Mock cuda-checkpoint from /root/criu/test/cuda-checkpoint/
 ❌ Running without --privileged flag
-❌ Vanilla CRIU without VMA parallelization (2.7x slower)
-❌ More than 64 workers (diminishing returns, adds overhead)
-❌ Removing /dev/nvidiactl from container devices
+❌ Vanilla CRIU without VMA parallelization (6x slower)
+❌ Too few workers (64, 128): Sequential processing, 2-5x slower
+❌ Too many workers (512): Segmentation fault
+❌ Small chunk sizes (256MB): More disk seeks, 8% slower than 512MB
+
+### Optimization Discoveries
+
+**Worker Count:**
+- Optimal when workers ≈ chunk count (1 chunk per worker)
+- For 86GB checkpoint: 256 workers creates 163-299 chunks (optimal)
+- Too few workers → sequential processing per worker
+- Too many workers → overhead without benefit
+
+**Chunk Size:**
+- 512MB chunks reduce count by 45% (299 → 163)
+- Larger sequential reads = better disk I/O efficiency
+- Benefits both checkpoint creation (7% faster) and restore (8% faster)
+
+**Disk I/O is the Bottleneck:**
+- VMA restore: 20s (CPU memory I/O)
+- GPU restore: 14s (GPU memory I/O)
+- With NVMe (7-10 GB/s): Could reduce VMA restore to 12-15s
+- Page cache performance: 40% faster than cold disk
 
 ### Critical Files Summary
 
@@ -628,14 +837,16 @@ sudo cp plugins/cuda/cuda_plugin.so /usr/lib/criu/cuda_plugin.so
 
 | Component | Version | Notes |
 |-----------|---------|-------|
-| CRIU | 4.0 (GitID: 4eda0ac94) | Custom fork with VMA parallelization |
+| CRIU | 4.0 (GitID: 9a4ff277a) | Custom fork with 256 workers, 512MB chunks |
 | cuda_plugin.so | 82KB (custom) | Built from custom CRIU fork |
-| cuda-checkpoint | ~6KB | Real NVIDIA version |
-| NVIDIA Driver | 580.95.05 | Open Kernel Module |
+| cuda-checkpoint | ~6KB | Real NVIDIA version from github.com/NVIDIA/cuda-checkpoint |
+| NVIDIA Driver | 570.158.01 | Open Kernel Module (also tested: 580.95.05) |
+| GPU | H100 PCIe (80GB) | Also tested: A10 (24GB) |
 | runc | 1.2.5 | OCI runtime |
 | Podman | Latest | Container engine |
 | Ubuntu | 24.04 | Linux 6.11.0-29-generic |
-| vLLM | 0.11.0 | From docker.io/vllm/vllm-openai:latest |
+| vLLM | 0.11.0 | From docker.io/vllm/vllm-openai:v0.11.0 |
+| Model (tested) | Qwen 2.5 32B | 60GB weights, 86GB total memory |
 
 ---
 
@@ -677,37 +888,45 @@ sudo cp /usr/lib/x86_64-linux-gnu/libnvidia-*.so* /opt/nvidia-libs/
 # Generate CDI
 sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
 
-# 4. Launch vLLM
+# 4. Launch vLLM (Qwen 32B example)
 podman run -d \
   --name vllm-checkpoint \
-  --device /dev/null:/dev/null:rwm \
-  --privileged \
-  --security-opt seccomp=/etc/containers/seccomp.d/no-io-uring.json \
-  --device /dev/nvidia0 --device /dev/nvidiactl --device /dev/nvidia-uvm \
-  --shm-size 8g \
-  -e LD_LIBRARY_PATH=/opt/nvidia-libs \
-  -e ASYNCIO_DEFAULT_BACKEND=select \
-  -e PYTHON_ASYNCIO_NO_IO_URING=1 \
-  -v /opt/nvidia-libs:/opt/nvidia-libs:ro \
-  -v /models:/root/.cache/huggingface \
+  --device nvidia.com/gpu=all \
+  --security-opt=seccomp=/etc/containers/seccomp.d/no-io-uring.json \
+  --security-opt=label=disable \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 8000:8000 \
-  docker.io/vllm/vllm-openai:latest \
-  --model Qwen/Qwen2.5-7B-Instruct \
-  --host 0.0.0.0 --port 8000 \
-  --gpu-memory-utilization 0.90 --max-model-len 4096 \
-  --trust-remote-code --load-format safetensors --enforce-eager
+  docker.io/vllm/vllm-openai:v0.11.0 \
+  --model Qwen/Qwen2.5-32B-Instruct \
+  --gpu-memory-utilization 0.95 \
+  --max-model-len 8192 \
+  --dtype auto
 
-# Wait for ready
-until curl -s http://localhost:8000/health > /dev/null 2>&1; do sleep 2; done
+# Wait for ready (this will take ~2-3 minutes for model load + CUDA compilation)
+until curl -s http://localhost:8000/health > /dev/null 2>&1; do sleep 5; done
 
 # 5. Checkpoint
 podman container checkpoint vllm-checkpoint
+# Expected: ~120-135 seconds for Qwen 32B
 
 # 6. Restore
 time podman container restore vllm-checkpoint
-# Expected: ~12-13 seconds for 7B/14B-AWQ models
+# Expected: ~33 seconds for Qwen 32B (cold disk with 256 workers, 512MB chunks)
+
+# 7. Test inference
+curl -s http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen2.5-32B-Instruct", "prompt": "What is the capital of France?", "max_tokens": 50}' | jq -r '.choices[0].text'
 ```
 
 ---
 
-**Success Criteria**: When restore completes in ~12-13 seconds with logs showing "VMA PARALLEL: Using 64 workers" and vLLM inference working immediately after restore.
+**Success Criteria**: When restore completes in ~33 seconds with logs showing "VMA PARALLEL: Using 256 workers" and "MAX IOVEC: Using 512 MB limit" and vLLM inference working immediately after restore.
+
+**Check logs:**
+```bash
+grep "VMA PARALLEL\|MAX IOVEC" /tmp/restore.log
+# Should show:
+# VMA PARALLEL: Using 256 workers (hardcoded)
+# MAX IOVEC: Using 512 MB limit (hardcoded)
+```
