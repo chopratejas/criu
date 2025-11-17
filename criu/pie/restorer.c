@@ -117,6 +117,9 @@ struct vma_worker_args {
 	struct vma_chunk_info *chunks;  /* Array of all chunks */
 	int chunk_start;                /* First chunk index for this worker */
 	int chunk_count;                /* Number of chunks assigned to this worker */
+	/* Memory-mapped pages file optimization */
+	void *mmap_base;                /* Base address of mmap'd pages file */
+	size_t mmap_size;               /* Size of mmap'd region */
 };
 
 /*
@@ -178,7 +181,7 @@ struct vma_chunk_info {
 	} while (0)
 
 static struct task_entries *task_entries_local;
-static struct vma_worker_args global_worker_args[128]; /* Global for CLONE_VM children */
+static struct vma_worker_args global_worker_args[256]; /* Global for CLONE_VM children */
 static futex_t thread_inprogress;
 static pid_t *helpers;
 static int n_helpers;
@@ -1808,6 +1811,8 @@ static long vma_loading_worker(void *arg)
 	unsigned long total_bytes = 0, total_syscalls = 0;
 	struct timespec worker_start, worker_end;
 	int chunk_idx;
+	int my_vma_fd;  /* Per-worker file descriptor */
+	char fd_path[64];
 
 	sys_clock_gettime(CLOCK_MONOTONIC, &worker_start);
 	pr_info("===== WORKER %d ENTRY: PID=%d, chunks=[%d..%d) (%d chunks), chunks_ptr=%p =====\n",
@@ -1819,6 +1824,51 @@ static long vma_loading_worker(void *arg)
 		pr_err("Worker %d: chunks pointer is NULL!\n", wargs->worker_id);
 		atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EINVAL);
 		sys_exit(1);
+	}
+
+	/* OPTIMIZATION: Check if pages file is memory-mapped */
+	if (wargs->mmap_base) {
+		pr_info("Worker %d: Using mmap'd pages (base=%p, size=%zu MB)\n",
+			wargs->worker_id, wargs->mmap_base,
+			wargs->mmap_size / (1024 * 1024));
+		my_vma_fd = -1; /* Not needed with mmap */
+	} else {
+		/* OPTIMIZATION: Open per-worker FD to eliminate file struct contention */
+		/* Reopen via /proc/self/fd/N to get independent file struct */
+		int shared_fd = wargs->vma_ios_fd;
+		char *p = fd_path;
+
+		/* Build "/proc/self/fd/NNN" string manually */
+		*p++ = '/'; *p++ = 'p'; *p++ = 'r'; *p++ = 'o'; *p++ = 'c';
+		*p++ = '/'; *p++ = 's'; *p++ = 'e'; *p++ = 'l'; *p++ = 'f';
+		*p++ = '/'; *p++ = 'f'; *p++ = 'd'; *p++ = '/';
+
+		/* Convert FD number to string */
+		if (shared_fd == 0) {
+			*p++ = '0';
+		} else {
+			char digits[16];
+			int num_digits = 0;
+			int n = shared_fd;
+			while (n > 0) {
+				digits[num_digits++] = '0' + (n % 10);
+				n /= 10;
+			}
+			while (num_digits > 0) {
+				*p++ = digits[--num_digits];
+			}
+		}
+		*p = '\0';
+
+		my_vma_fd = sys_open(fd_path, O_RDONLY | O_CLOEXEC, 0);
+		if (my_vma_fd < 0) {
+			pr_err("Worker %d: Failed to open per-worker FD via %s: %d\n",
+			       wargs->worker_id, fd_path, my_vma_fd);
+			atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EIO);
+			sys_exit(1);
+		}
+		pr_info("Worker %d: Opened per-worker FD %d (shared was %d)\n",
+			wargs->worker_id, my_vma_fd, shared_fd);
 	}
 
 	/* Calculate total bytes assigned to this worker */
@@ -1884,44 +1934,66 @@ static long vma_loading_worker(void *arg)
 		}
 
 		/* Load data for this chunk */
-		while (nr > 0) {
-			ssize_t r = preadv_limited(wargs->vma_ios_fd, iovs, nr, offset,
-						    wargs->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
-			if (r < 0) {
-				pr_err("Worker %d (PID %d): Can't read pages data for chunk %d (%d)\n",
-				       wargs->worker_id, my_pid, chunk_idx, (int)r);
-				atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EIO);
+		if (wargs->mmap_base) {
+			/* OPTIMIZATION: Use memcpy from mmap'd pages file (zero-copy) */
+			char *src = (char *)wargs->mmap_base + offset;
+
+			/* Validate offset is within mmap'd region */
+			if (offset + chunk->bytes > wargs->mmap_size) {
+				pr_err("Worker %d: chunk offset %lld + size %lu exceeds mmap size %zu\n",
+				       wargs->worker_id, (long long)offset, chunk->bytes, wargs->mmap_size);
+				atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EINVAL);
 				sys_exit(1);
 			}
 
-			chunk_bytes_read += r;
-			total_syscalls++;
-
-			/* Punch holes if auto_dedup enabled */
-			if (r > 0 && wargs->auto_dedup) {
-				int fr = sys_fallocate(wargs->vma_ios_fd,
-						       FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-						       offset, r);
-				if (fr < 0) {
-					pr_debug("Worker %d: Failed to punch holes: %d\n",
-						 wargs->worker_id, fr);
-				}
+			/* Copy from mmap to all iovecs in this chunk */
+			for (j = 0; j < nr; j++) {
+				memcpy(iovs[j].iov_base, src, iovs[j].iov_len);
+				src += iovs[j].iov_len;
+				chunk_bytes_read += iovs[j].iov_len;
 			}
-
-			offset += r;
-
-			/* Advance iovecs */
-			do {
-				if (iovs->iov_len <= r) {
-					r -= iovs->iov_len;
-					iovs++;
-					nr--;
-					continue;
+			total_syscalls++; /* Count as one "operation" */
+		} else {
+			/* Fallback: Use preadv with per-worker FD */
+			while (nr > 0) {
+				ssize_t r = preadv_limited(my_vma_fd, iovs, nr, offset,
+							    wargs->auto_dedup ? AUTO_DEDUP_OVERHEAD_BYTES : 0);
+				if (r < 0) {
+					pr_err("Worker %d (PID %d): Can't read pages data for chunk %d (%d)\n",
+					       wargs->worker_id, my_pid, chunk_idx, (int)r);
+					atomic_cmpxchg(&wargs->task_entries->cr_err, 0, EIO);
+					sys_exit(1);
 				}
-				iovs->iov_base += r;
-				iovs->iov_len -= r;
-				break;
-			} while (nr > 0);
+
+				chunk_bytes_read += r;
+				total_syscalls++;
+
+				/* Punch holes if auto_dedup enabled */
+				if (r > 0 && wargs->auto_dedup) {
+					int fr = sys_fallocate(my_vma_fd,
+							       FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+							       offset, r);
+					if (fr < 0) {
+						pr_debug("Worker %d: Failed to punch holes: %d\n",
+							 wargs->worker_id, fr);
+					}
+				}
+
+				offset += r;
+
+				/* Advance iovecs */
+				do {
+					if (iovs->iov_len <= r) {
+						r -= iovs->iov_len;
+						iovs++;
+						nr--;
+						continue;
+					}
+					iovs->iov_base += r;
+					iovs->iov_len -= r;
+					break;
+				} while (nr > 0);
+			}
 		}
 
 		total_bytes += chunk_bytes_read;
@@ -1941,6 +2013,9 @@ static long vma_loading_worker(void *arg)
 			wargs->worker_id, my_pid, total_bytes, total_syscalls, elapsed_us,
 			elapsed_us > 0 ? ((double)total_bytes / (1024.0 * 1024.0)) / ((double)elapsed_us / 1000000.0) : 0.0);
 	}
+
+	/* Close per-worker FD */
+	sys_close(my_vma_fd);
 
 	/* Signal completion and exit */
 	pr_info("Worker %d (PID %d): signaling completion via futex\n", wargs->worker_id, my_pid);
@@ -2307,19 +2382,19 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	/* Parallel VMA loading if workers configured */
 	if (args->vma_parallel_workers > 0 && args->vma_ios_n >= 1) {
 		int num_workers = args->vma_parallel_workers;
-		pid_t worker_pids[128]; /* Max 128 workers */
+		pid_t worker_pids[256]; /* Max 256 workers */
 		struct vma_worker_args *worker_args = global_worker_args; /* Use global for CLONE_VM access */
-		void *worker_stacks[128];
+		void *worker_stacks[256];
 		futex_t worker_completion;
 		k_rtsigset_t sigchld_mask, old_mask;
 		int w, i, worker_base_idx;
-		struct vma_chunk_info chunks[256];  /* Max 256 chunks (reduce to save stack space) */
+		struct vma_chunk_info chunks[512];  /* Max 512 chunks */
 		int num_chunks, chunks_per_worker, leftover_chunks;
 
 		pr_info("PIE: *** ENTERING PARALLEL VMA LOADING PATH ***\n");
 
-		if (num_workers > 128)
-			num_workers = 128;
+		if (num_workers > 256)
+			num_workers = 256;
 		if (num_workers > args->vma_ios_n)
 			num_workers = args->vma_ios_n;
 
@@ -2360,7 +2435,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		 */
 		pr_info("Computing chunk assignments for load balancing...\n");
 		num_chunks = compute_vma_chunks(args->vma_ios, args->vma_ios_n,
-						num_workers, chunks, 256);
+						num_workers, chunks, 512);
 		if (num_chunks < 0) {
 			pr_err("Failed to compute VMA chunks\n");
 			goto core_restore_end;
@@ -2412,6 +2487,11 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		n_helpers += num_workers;
 		pr_info("Updated helpers_n=%d, n_helpers=%d\n", args->helpers_n, n_helpers);
 
+		/* NOTE: mmap optimization disabled - caused page fault contention */
+		/* With 256 workers all faulting pages from same mmap, kernel serializes */
+		/* page fault handling. Per-worker FDs perform better with true parallelism. */
+		pr_info("Using per-worker FD optimization (mmap disabled due to page fault contention)\n");
+
 		/* Block SIGCHLD to prevent handler from running during spawn+register */
 		ksigemptyset(&sigchld_mask);
 		ksigaddset(&sigchld_mask, SIGCHLD);
@@ -2444,6 +2524,8 @@ __visible long __export_restore_task(struct task_restore_args *args)
 			worker_args[w].chunks = chunks;
 			worker_args[w].chunk_start = chunk_start;
 			worker_args[w].chunk_count = chunk_count;
+			worker_args[w].mmap_base = NULL;  /* mmap disabled */
+			worker_args[w].mmap_size = 0;
 
 			pr_info("Worker %d: assigned chunks [%d..%d) (%d chunks), chunks_ptr=%p\n",
 				w, chunk_start, chunk_start + chunk_count, chunk_count, chunks);
@@ -2495,6 +2577,35 @@ __visible long __export_restore_task(struct task_restore_args *args)
 		pr_info("Waiting for %d workers to complete memory loading via futex...\n", num_workers);
 		futex_wait_until(&worker_completion, 0);
 		pr_info("All workers signaled memory loading completion via futex\n");
+
+		/* OPTIMIZATION: Apply MADV_HUGEPAGE to all restored memory regions */
+		pr_info("Applying MADV_HUGEPAGE hints to restored memory...\n");
+		{
+			struct restore_vma_io *rio = args->vma_ios;
+			unsigned long total_hugepage_bytes = 0;
+			int hugepage_count = 0;
+
+			for (i = 0; i < args->vma_ios_n; i++) {
+				/* Apply hugepage hint to each VMA's data */
+				for (int j = 0; j < rio->nr_iovs; j++) {
+					unsigned long addr = (unsigned long)rio->iovs[j].iov_base;
+					size_t len = rio->iovs[j].iov_len;
+
+					/* Only apply to large enough regions (>= 2MB) */
+					if (len >= (2 * 1024 * 1024)) {
+						sys_madvise(addr, len, MADV_HUGEPAGE);
+						total_hugepage_bytes += len;
+						hugepage_count++;
+					}
+				}
+				rio = ((void *)rio) + RIO_SIZE(rio->nr_iovs);
+			}
+
+			if (hugepage_count > 0) {
+				pr_info("Applied MADV_HUGEPAGE to %d regions (%.2f GB total)\n",
+					hugepage_count, (double)total_hugepage_bytes / (1024.0 * 1024.0 * 1024.0));
+			}
+		}
 
 		/* Check if any worker set error flag during loading */
 		if (atomic_read(&task_entries_local->cr_err)) {

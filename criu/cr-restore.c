@@ -2425,10 +2425,10 @@ int cr_restore_tasks(void)
 			return -1;
 	}
 
-	/* HARDCODED: Force VMA parallel workers = 64 and max iovec size = 256MB */
+	/* HARDCODED: Force VMA parallel workers = 256 and max iovec size = 512MB */
 	{
-		opts.vma_parallel_workers = 64;
-		opts.max_iovec_mb = 256;
+		opts.vma_parallel_workers = 256;
+		opts.max_iovec_mb = 512;
 		pr_info("VMA PARALLEL: Using %d workers (hardcoded)\n", opts.vma_parallel_workers);
 		pr_info("MAX IOVEC: Using %d MB limit (hardcoded)\n", opts.max_iovec_mb);
 	}
